@@ -192,6 +192,12 @@ ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwi
 ```
 
 Optional: evaluate released LIBERO checkpoint:
+Note: 先生成text embedding
+```bash
+# 第1步：预编码（只需一次，T5 在 CPU 上，不占 GPU）
+python scripts/precompute_libero_text_embeds.py \
+  --output-dir checkpoints/libero_text_embeds
+```
 
 The released `LIBERO` / `RoboTwin` evaluation managers default to `8` GPUs
 (`MULTIRUN.num_gpus=8` in `configs/sim_libero.yaml` and `configs/sim_robotwin.yaml`).
