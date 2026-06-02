@@ -192,7 +192,7 @@ ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwi
 ```
 
 Optional: evaluate released LIBERO checkpoint:
-Note: 先生成text embedding
+先生成text embedding
 ```bash
 # 第1步：预编码（只需一次，T5 在 CPU 上，不占 GPU）
 python scripts/precompute_libero_text_embeds.py \
