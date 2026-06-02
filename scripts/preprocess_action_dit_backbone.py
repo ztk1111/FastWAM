@@ -1,3 +1,25 @@
+"""
+ActionDiT 骨干网络预处理脚本 —— 从 WanVideoDiT 权重插值生成 ActionDiT 初始权重。
+
+该脚本将 Wan2.2 视频 DiT（WanVideoDiT）的骨干网络权重通过形状适配插值，
+转换为 ActionDiT（动作条件 DiT）的初始权重。核心逻辑包括：
+    1. 加载视频 DiT 和创建 ActionDiT 空网络
+    2. 对骨干网络中的每个张量，如果形状不同则进行多维插值
+    3. 可选的 alpha 缩放（alpha = sqrt(d_v / d_a)），用于修正维度变化引起的方差偏移
+    4. 保存为 .pt 格式的载荷文件，供训练时加载
+
+典型用法:
+    python scripts/preprocess_action_dit_backbone.py \
+        --model-config configs/model/fastwam.yaml \
+        --output data/backbones/action_dit_backbone.pt \
+        --dtype bfloat16 --device cuda
+
+背景:
+    ActionDiT 与 WanVideoDiT 共享相同的骨干网络结构（层数、头数、注意力头维度），
+    但部分张量的最后一维（如 hidden_dim）可能不同（视频 DiT 为 1536，动作 DiT 通常更小）。
+    该脚本通过顺序的 1D 线性插值适配这些维度差异。
+"""
+
 import argparse
 from pathlib import Path
 from typing import Any
@@ -11,6 +33,18 @@ from fastwam.models.wan22.helpers.loader import load_wan22_ti2v_5b_components
 
 
 def _parse_dtype(name: str) -> torch.dtype:
+    """
+    将字符串格式的数据类型名称解析为 PyTorch 数据类型。
+
+    参数:
+        name (str): 数据类型名称，支持 "float32", "float16", "bfloat16"
+
+    返回:
+        torch.dtype: 对应的 PyTorch 数据类型
+
+    异常:
+        ValueError: 不支持的数据类型名称
+    """
     value = str(name).strip().lower()
     if value == "float32":
         return torch.float32
@@ -22,6 +56,20 @@ def _parse_dtype(name: str) -> torch.dtype:
 
 
 def _parse_bool(name: str) -> bool:
+    """
+    将字符串解析为布尔值。
+
+    支持多种格式：1/0, true/false, yes/no, y/n。
+
+    参数:
+        name (str): 要解析的字符串
+
+    返回:
+        bool: 解析后的布尔值
+
+    异常:
+        ValueError: 无法解析的输入
+    """
     value = str(name).strip().lower()
     if value in {"1", "true", "yes", "y"}:
         return True
@@ -31,10 +79,35 @@ def _parse_bool(name: str) -> bool:
 
 
 def _is_unresolved_interpolation(value: Any) -> bool:
+    """
+    检查值是否为未解析的 OmegaConf 插值表达式。
+
+    OmegaConf 中形如 "${video_dit_config.hidden_dim}" 的字符串
+    在配置加载时可能未被解析（resolve=False 模式）。
+
+    参数:
+        value (Any): 待检查的值
+
+    返回:
+        bool: 如果是未解析的插值表达式则返回 True
+    """
     return isinstance(value, str) and "${" in value and "}" in value
 
 
 def _resolve_from_video_cfg(value: Any, video_cfg: dict[str, Any]) -> Any:
+    """
+    如果值是引用 video_dit_config 的插值表达式，则从 video_cfg 中解析其值。
+
+    例如，若 action 配置中的 "num_heads" 为 "${video_dit_config.num_heads}"，
+    则从 video_cfg 字典中取出对应的整数值。
+
+    参数:
+        value (Any): 可能包含插值表达式的值
+        video_cfg (dict): 视频 DiT 配置字典
+
+    返回:
+        Any: 解析后的值（如果无法解析则返回原始值）
+    """
     if not _is_unresolved_interpolation(value):
         return value
     text = str(value).strip()
@@ -51,6 +124,23 @@ def _resolve_from_video_cfg(value: Any, video_cfg: dict[str, Any]) -> Any:
 
 
 def _interpolate_last_dim(tensor: torch.Tensor, new_size: int) -> torch.Tensor:
+    """
+    对张量的最后一维进行 1D 线性插值。
+
+    将任意形状的张量展平为 [N, 1, last_dim] 进行线性插值，
+    然后恢复原始形状（最后一维替换为 new_size）。
+
+    输入维度示例:
+        - 输入: [N, 1536] -> 插值到新大小 -> [N, 128]
+        - 输入: [L, D]  = [30, 1536] -> 插值 -> [30, 128]
+
+    参数:
+        tensor (torch.Tensor): 输入张量
+        new_size (int): 目标最后一维大小
+
+    返回:
+        torch.Tensor: 插值后的张量，shape 为 (*tensor.shape[:-1], new_size)
+    """
     if tensor.shape[-1] == new_size:
         return tensor
     flat = tensor.reshape(-1, 1, tensor.shape[-1]).to(torch.float32)
@@ -59,6 +149,33 @@ def _interpolate_last_dim(tensor: torch.Tensor, new_size: int) -> torch.Tensor:
 
 
 def _resize_tensor_to_shape(src: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+    """
+    将源张量插值到目标形状，支持多维度的逐维插值。
+
+    对每个维度逐一检查，如果当前大小与目标不同，则通过 permute + 1D 插值调整。
+    该方法会处理维度不一致的情况（增加或减少维度）。
+
+    算法：
+        对每个维度 dim:
+            1. 将该维度 permute 到最后一维
+            2. 调用 _interpolate_last_dim 进行 1D 线性插值
+            3. 用逆 permute 恢复原始维度顺序
+
+    输入输出示例:
+        - 源 [1536] -> 目标 [128]
+        - 源 [1536, 1536] -> 目标 [128, 128]
+        - 源 [30, 1536] -> 目标 [30, 128]
+
+    参数:
+        src (torch.Tensor): 源张量
+        target_shape (tuple): 目标形状
+
+    返回:
+        torch.Tensor: 插值到目标形状的张量
+
+    异常:
+        ValueError: 无法减少 batch 维度或插值结果形状不匹配
+    """
     if tuple(src.shape) == tuple(target_shape):
         return src
 
@@ -97,6 +214,25 @@ def _resize_tensor_to_shape(src: torch.Tensor, target_shape: tuple[int, ...]) ->
 
 
 def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    从 YAML 配置文件加载视频 DiT 和 Action DiT 的配置字典。
+
+    解析配置文件中顶层 key "video_dit_config" 和 "action_dit_config"。
+    如果 action_dim 是未解析的插值表达式，则默认设为 7。
+    同时解析 action 配置中引用 video 配置的字段（如 num_heads, attn_head_dim, num_layers 等）。
+
+    参数:
+        path (Path): YAML 配置文件路径（如 configs/model/fastwam.yaml）
+
+    返回:
+        tuple: (video_cfg, action_cfg, full_cfg)
+            - video_cfg (dict): 视频 DiT 配置
+            - action_cfg (dict): 动作 DiT 配置
+            - full_cfg: 完整配置对象
+
+    异常:
+        ValueError: 配置中缺少必要字段或类型不正确
+    """
     cfg = OmegaConf.load(str(path))
     if "video_dit_config" not in cfg or "action_dit_config" not in cfg:
         raise ValueError(
@@ -123,6 +259,21 @@ def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _require_int_config(cfg: dict[str, Any], key: str) -> int:
+    """
+    从配置字典中获取一个整数类型的配置项。
+
+    如果配置项是未解析的插值表达式则抛出错误，确保在预处理时所有值都已解析。
+
+    参数:
+        cfg (dict): 配置字典
+        key (str): 配置键名
+
+    返回:
+        int: 配置值
+
+    异常:
+        ValueError: 配置值为未解析的插值表达式
+    """
     value = cfg.get(key)
     if _is_unresolved_interpolation(value):
         raise ValueError(f"`{key}` is unresolved interpolation: {value}")
@@ -130,6 +281,19 @@ def _require_int_config(cfg: dict[str, Any], key: str) -> int:
 
 
 def _require_float_config(cfg: dict[str, Any], key: str) -> float:
+    """
+    从配置字典中获取一个浮点数类型的配置项。
+
+    参数:
+        cfg (dict): 配置字典
+        key (str): 配置键名
+
+    返回:
+        float: 配置值
+
+    异常:
+        ValueError: 配置值为未解析的插值表达式
+    """
     value = cfg.get(key)
     if _is_unresolved_interpolation(value):
         raise ValueError(f"`{key}` is unresolved interpolation: {value}")
@@ -137,6 +301,27 @@ def _require_float_config(cfg: dict[str, Any], key: str) -> float:
 
 
 def main() -> None:
+    """
+    主处理函数：从 WanVideoDiT 提取骨干网络权重，插值适配后保存为 ActionDiT 初始权重。
+
+    处理流程：
+        1. 解析命令行参数
+        2. 加载模型 YAML 配置文件，解析 video_dit_config 和 action_dit_config
+        3. 加载 WanVideoDiT 预训练模型（通过 load_wan22_ti2v_5b_components）
+        4. 创建空的 ActionDiT 模型
+        5. 校验 ActionDiT 与 VideoDiT 的关键结构（num_heads, attn_head_dim, num_layers）一致
+        6. 遍历 ActionDiT 骨干网络的所有权重键：
+            a. 如果形状与视频 DiT 相同，直接拷贝
+            b. 如果形状不同，执行 _resize_tensor_to_shape 进行多维线性插值
+            c. 可选的 alpha 缩放：当最后一维尺寸变化时，
+               用 alpha = sqrt(dim_src / dim_tgt) 缩放权重以保持方差稳定
+        7. 组装包含策略描述、权重组和元信息的载荷字典
+        8. 保存为 .pt 文件供训练时加载
+
+    Alpha 缩放原理:
+        当在权重插值中改变张量维度时，输出的方差会相应变化。
+        alpha 因子在数学上等价于在保持权重初始化方差守恒的前提下调整缩放。
+    """
     parser = argparse.ArgumentParser(
         description="Preprocess ActionDiT backbone weights from WanVideoDiT and save as .pt payload."
     )
@@ -160,6 +345,7 @@ def main() -> None:
     torch_dtype = _parse_dtype(args.dtype)
     redirect_common_files = _parse_bool(cfg.get("redirect_common_files", False))
 
+    # 确保所有关键的数值型配置在预处理时都已解析（不能有未解析的 ${} 插值）
     int_fields = ["hidden_dim", "action_dim", "ffn_dim", "num_layers", "num_heads", "attn_head_dim", "text_dim", "freq_dim"]
     for key in int_fields:
         action_cfg[key] = _require_int_config(action_cfg, key)
@@ -168,6 +354,8 @@ def main() -> None:
     print(f"[INFO] Loaded model config from {model_config_path}. "
           f"Preprocessing ActionDiT backbone with dtype={torch_dtype} on device={args.device}, "
           f"apply_alpha_scaling={apply_alpha_scaling}.")
+    load_text_encoder = _parse_bool(cfg.get("load_text_encoder", False))
+    # 加载 Wan2.2 视频 DiT 预训练组件
     components = load_wan22_ti2v_5b_components(
         device=args.device,
         torch_dtype=torch_dtype,
@@ -175,10 +363,13 @@ def main() -> None:
         tokenizer_model_id=cfg.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
         redirect_common_files=redirect_common_files,
         dit_config=video_cfg,
+        load_text_encoder=load_text_encoder,
     )
     video_expert = components.dit
 
     action_expert = ActionDiT(**action_cfg).to(device=args.device, dtype=torch_dtype)
+
+    # 校验 MoT 混合注意力所需的关键结构一致性
     if int(action_cfg["num_heads"]) != int(video_expert.num_heads):
         raise ValueError("ActionDiT `num_heads` must match video expert for MoT mixed attention.")
     if int(action_cfg["attn_head_dim"]) != int(video_expert.attn_head_dim):
@@ -188,6 +379,7 @@ def main() -> None:
 
     action_state = action_expert.state_dict()
     video_state = video_expert.state_dict()
+    # 仅处理骨干网络权重（排除 action_embed 等特定层）
     backbone_keys = ActionDiT.backbone_key_set(action_state.keys())
 
     backbone_state_dict: dict[str, torch.Tensor] = {}
@@ -199,16 +391,20 @@ def main() -> None:
         src = video_state[key]
         target = action_state[key]
         if tuple(src.shape) == tuple(target.shape):
+            # 形状相同，直接复制视频 DiT 权重
             value = src
             copied += 1
         else:
+            # 形状不同，执行多维插值适配
             value = _resize_tensor_to_shape(src, tuple(target.shape))
             if apply_alpha_scaling and src.ndim >= 2 and src.shape[-1] != target.shape[-1]:
+                # alpha = sqrt(d_v / d_a)：当维度变化时保持权重方差
                 alpha = (float(src.shape[-1]) / float(target.shape[-1])) ** 0.5
                 value = value.to(torch.float32) * alpha
             interpolated += 1
         backbone_state_dict[key] = value.detach().to(dtype=target.dtype, device="cpu").contiguous()
 
+    # 组装最终载荷：包含处理策略描述、权重数据和元信息
     payload = {
         "policy": {
             "skip_prefixes": list(ActionDiT.ACTION_BACKBONE_SKIP_PREFIXES),

@@ -9,11 +9,39 @@ from .fastwam_joint import FastWAMJoint
 
 logger = get_logger(__name__)
 
+"""
+FastWAMIDM（Inverse Dynamics Model）变体模型模块。
+
+该文件定义了 FastWAMIDM 类，继承自 FastWAMJoint。IDM（逆动力学模型）的核心思想是：
+给定视频观测序列，预测产生这些观测的潜在动作。
+
+FastWAMIDM 的关键特点：
+  - 训练时采用 Teacher-Forcing 策略：条件视频分支使用原始（或轻微加噪）的视频，
+    噪声视频分支用于视频去噪学习，动作分支以条件视频为上下文进行去噪
+  - 推理时采用两阶段流程：第一阶段独立去噪生成视频，第二阶段以生成的视频为条件去噪动作
+  - 条件视频以一定概率（video_cond_noise_prob）被加噪，增强对噪声的鲁棒性
+"""
+
 
 class FastWAMIDM(FastWAMJoint):
-    """IDM variant with teacher-forcing video conditioning for action denoising."""
+    """FastWAMIDM（逆动力学模型）变体类。
+
+    继承自 FastWAMJoint。IDM 模式将视频视为已知条件，专注于从视频中推断动作，
+    即建模 P(action | video, context) 的逆动力学。
+
+    训练流程：
+      1. 三个分支并行：噪声视频（A）、加噪动作（B）、条件视频（C）
+      2. 视频专家处理 A + C（拼接作为视频序列），动作专家处理 B
+      3. 构建 Teacher-Forcing 注意力掩码：动作可关注条件视频（C）而非噪声视频（A）
+      4. 仅噪声视频分支参与视频损失，动作分支正常计算动作损失
+
+    推理流程：
+      第一阶段：独立去噪视频（使用 video_expert 直接推理，无动作条件）
+      第二阶段：以去噪后的视频为条件，通过 KV 缓存高效去噪动作
+    """
 
     # Hardcoded probability: during training, cond-video is noised with this chance.
+    # 训练时条件视频被加噪的概率。用于增强对噪声视频条件的鲁棒性
     video_cond_noise_prob = 0.5
 
     @torch.no_grad()
@@ -26,6 +54,28 @@ class FastWAMIDM(FastWAMJoint):
         cond_video_tokens_per_frame: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """构建 Teacher-Forcing 训练模式的注意力掩码。
+
+        在 IDM 训练中，视频专家处理两个分支的拼接：[噪声视频 | 条件视频]。
+        动作专家处理动作分支。注意力规则：
+          - 噪声视频 -> 噪声视频: 使用视频专家掩码（通常是 causal）
+          - 条件视频 -> 条件视频: 使用视频专家掩码
+          - 动作 -> 动作: 完全可见
+          - 动作 -> 条件视频: 完全可见（动作观察条件视频来推断动作）
+          - 噪声视频与条件视频之间无注意力交互（隔离）
+
+        参数:
+            noisy_video_seq_len (int): 噪声视频分支的 token 数
+            cond_video_seq_len (int): 条件视频分支的 token 数
+            action_seq_len (int): 动作分支的 token 数
+            noisy_video_tokens_per_frame (int): 噪声视频每帧 token 数
+            cond_video_tokens_per_frame (int): 条件视频每帧 token 数
+            device: 目标设备
+
+        返回:
+            mask [total_seq_len, total_seq_len] 布尔张量
+              序列布局: [noisy_video | cond_video | action]
+        """
         if noisy_video_tokens_per_frame != cond_video_tokens_per_frame:
             raise ValueError(
                 "Teacher-forcing requires identical `tokens_per_frame` for noisy and cond video branches, "
@@ -51,11 +101,27 @@ class FastWAMIDM(FastWAMJoint):
         )
         # action -> action
         mask[cond_end:, cond_end:] = True
-        # action -> cond_video only
+        # action -> cond_video only（不关注噪声视频）
         mask[cond_end:, noisy_end:cond_end] = True
         return mask
 
     def training_loss(self, sample, tiled: bool = False):
+        """FastWAMIDM 的训练损失计算。
+
+        与父类的关键区别：
+          1. 三个分支并行处理：
+             - 分支 A（噪声视频）：视频扩散目标的标准加噪视频
+             - 分支 B（加噪动作）：动作扩散目标的标准加噪动作
+             - 分支 C（条件视频）：teacher-forcing 条件视频（每样本独立概率加噪）
+          2. 视频专家输入 = [分支A tokens | 分支C tokens] 拼接
+          3. 使用 _build_teacher_forcing_attention_mask 代替标准掩码
+          4. 联合损失 = 视频损失（仅分支A）+ 动作损失（分支B）
+
+        输入: sample (dict) — 包含 video, context, context_mask, action 等
+              tiled (bool): VAE 分块处理
+
+        输出: (loss_total, loss_dict)
+        """
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -67,6 +133,7 @@ class FastWAMIDM(FastWAMJoint):
         fuse_flag = inputs["fuse_vae_embedding_in_latents"]
 
         # Branch A: noisy video (for video denoising target).
+        # 分支 A：噪声视频（用于视频去噪目标）
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -79,6 +146,7 @@ class FastWAMIDM(FastWAMJoint):
             latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
 
         # Branch B: noisy action.
+        # 分支 B：加噪动作
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -89,7 +157,9 @@ class FastWAMIDM(FastWAMJoint):
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
         # Branch C: teacher-forcing cond-video.
+        # 分支 C：Teacher-Forcing 条件视频
         # Each sample is independently noised with probability `video_cond_noise_prob`.
+        # 每个样本独立地以 probability=video_cond_noise_prob 的概率被加噪
         cond_noise_mask = torch.rand((batch_size,), device=self.device) < float(self.video_cond_noise_prob)
         timestep_video_cond = torch.zeros_like(timestep_video, dtype=input_latents.dtype, device=self.device)
         latents_cond = input_latents
@@ -106,10 +176,12 @@ class FastWAMIDM(FastWAMJoint):
             )
             cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
             latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
+        # 首帧始终保持一致（无论是否加噪）
         if inputs["first_frame_latents"] is not None:
             latents_cond = latents_cond.clone()
             latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
 
+        # ---- pre_dit 编码 ----
         video_pre_noisy = self.video_expert.pre_dit(
             x=latents_noisy,
             timestep=timestep_video,
@@ -145,11 +217,13 @@ class FastWAMIDM(FastWAMJoint):
         cond_video_tokens_per_frame = int(video_pre_cond["meta"]["tokens_per_frame"])
 
         # Concatenate [noisy_video, cond_video] as the video expert sequence.
+        # 将 [噪声视频 | 条件视频] 拼接作为视频专家的完整 token 序列
         merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
         merged_video_freqs = torch.cat([video_pre_noisy["freqs"], video_pre_cond["freqs"]], dim=0)
         merged_video_t_mod = torch.cat([video_pre_noisy["t_mod"], video_pre_cond["t_mod"]], dim=1)
         merged_video_context_mask = torch.cat([video_pre_noisy["context_mask"], video_pre_cond["context_mask"]], dim=1)
 
+        # 使用 Teacher-Forcing 注意力掩码：动作仅关注条件视频
         attention_mask = self._build_teacher_forcing_attention_mask(
             noisy_video_seq_len=noisy_video_seq_len,
             cond_video_seq_len=cond_video_seq_len,
@@ -159,6 +233,7 @@ class FastWAMIDM(FastWAMJoint):
             device=merged_video_tokens.device,
         )
 
+        # ---- MoT 混合注意力 ----
         tokens_out = self.mot(
             embeds_all={
                 "video": merged_video_tokens,
@@ -186,10 +261,12 @@ class FastWAMIDM(FastWAMJoint):
         )
 
         # Only the noisy-video half contributes to video denoising loss.
+        # 仅噪声视频部分参与视频去噪损失（条件视频不产生视频损失）
         pred_video_tokens = tokens_out["video"][:, :noisy_video_seq_len]
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
+        # ---- 损失计算 ----
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
             pred_video = pred_video[:, :, 1:]
@@ -244,7 +321,15 @@ class FastWAMIDM(FastWAMJoint):
         rand_device: str = "cpu",
         tiled: bool = False,
     ) -> dict[str, Any]:
+        """FastWAMIDM 的纯动作推理。
+
+        IDM 模式的动作推理复用 infer_joint 的两阶段流程，但仅返回动作结果。
+
+        参数:
+            同父类 FastWAMJoint.infer_action。
+        """
         # Reuse infer_joint pipeline and keep infer_action output contract.
+        # 复用 infer_joint 流程，仅返回动作输出以保持 infer_action 接口合约
         out = self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -285,6 +370,27 @@ class FastWAMIDM(FastWAMJoint):
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
     ) -> dict[str, Any]:
+        """FastWAMIDM 的两阶段联合推理。
+
+        阶段 1：视频去噪
+          使用 video_expert 独立执行视频去噪（不依赖动作条件）。
+          这是标准的视频扩散过程，从纯噪声逐步恢复为视频。
+
+        阶段 2：动作去噪
+          以阶段 1 生成的完整视频为条件（teacher-forcing 模式），通过 KV 缓存
+          高效地去噪动作序列。视频侧的时间步设为 0（视为已知条件）。
+
+        与父类的区别：
+          - 第一阶段完全独立去噪视频，使用 video_expert 直接从噪声到视频
+          - 第二阶段以完整的去噪视频作为条件（而非仅首帧）
+          - 使用 _build_mot_attention_mask 构建动作对完整视频的注意力
+
+        参数:
+            同父类 FastWAMJoint.infer_joint
+
+        返回:
+            dict: {"video": list[Image], "action": Tensor [T, a_dim]}
+        """
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
 
@@ -324,10 +430,12 @@ class FastWAMIDM(FastWAMJoint):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
+        # 计算隐空间维度
         latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
+        # 生成初始噪声
         video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
@@ -343,11 +451,13 @@ class FastWAMIDM(FastWAMJoint):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
+        # 编码首帧并替代噪声首帧
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
+        # 条件上下文处理
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -378,6 +488,7 @@ class FastWAMIDM(FastWAMJoint):
             )
 
         # Stage 1: denoise video only.
+        # 第一阶段：仅去噪视频。使用 video_expert 独立进行视频扩散
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -398,6 +509,7 @@ class FastWAMIDM(FastWAMJoint):
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         # Stage 2: freeze denoised video as cond and denoise action via video K/V cache.
+        # 第二阶段：冻结去噪后的视频作为条件，通过 KV 缓存高效去噪动作
         timestep_video_cond = torch.zeros(
             (latents_video.shape[0],), dtype=latents_video.dtype, device=self.device
         )
@@ -410,12 +522,14 @@ class FastWAMIDM(FastWAMJoint):
             fuse_vae_embedding_in_latents=fuse_flag,
         )
         video_seq_len = int(video_pre_cond["tokens"].shape[1])
+        # 构建动作可关注完整视频的注意力掩码
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
             device=video_pre_cond["tokens"].device,
         )
+        # 预填充视频 KV 缓存
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre_cond["tokens"],
             video_freqs=video_pre_cond["freqs"],
@@ -427,6 +541,7 @@ class FastWAMIDM(FastWAMJoint):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
+        # 动作去噪循环
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,

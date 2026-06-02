@@ -14,9 +14,42 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
 
+"""
+FastWAM（Fast World Action Model）主模型模块。
+
+该文件定义了 FastWAM 类，是 FastWAM 项目的核心模型。FastWAM 通过 MoT（Mixture-of-Transformers）
+混合注意力机制，将视频生成专家（基于 Wan2.2-TI2V）与动作生成专家（ActionDiT）深度融合，
+实现视频-动作的联合扩散建模与推理。
+
+主要功能：
+  - 联合视频-动作训练（training_loss），支持 padding mask 和逐样本权重
+  - 联合视频-动作推理（infer_joint），同步去噪生成视频和动作序列
+  - 纯动作推理（infer_action），利用视频首帧预填充 KV 缓存加速
+  - VAE 编码/解码，支持 tiled 分块处理
+  - 文本提示编码及可选的 Proprioception（本体感知）编码融合
+  - 模型检查点保存/加载（save_checkpoint / load_checkpoint）
+"""
+
 
 class FastWAM(torch.nn.Module):
-    """MoT world model with video/action experts."""
+    """FastWAM 主模型类。
+
+    继承自 torch.nn.Module。
+    通过 MoT 层混合视频专家（video_expert）和动作专家（action_expert）的注意力，
+    实现视频-动作联合扩散。
+
+    训练时（training_loss）：
+      对视频和动作分别使用 Flow Matching 调度器采样时间步、加噪，
+      各自经过 pre_dit 编码为 token 序列，在 MoT 层中进行混合注意力交互，
+      最后通过 post_dit 重建预测噪声，计算 MSE 损失。
+
+    推理时支持三种模式：
+      - infer_joint：视频与动作同步去噪，每个去噪步联合预测两种模态的噪声
+      - infer_action：仅动作去噪，视频侧使用预填充 KV 缓存以加速迭代
+      - infer：infer_joint 的简单别名
+
+    使用 from_wan22_pretrained 工厂方法从预训练检查点加载模型组件。
+    """
 
     def __init__(
         self,
@@ -39,11 +72,34 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ):
+        """初始化 FastWAM 模型。
+
+        参数:
+            video_expert: 视频专家 DiT 模型（WanVideoDiT 实例），负责视频隐空间的去噪
+            action_expert (ActionDiT): 动作专家 DiT 模型，负责动作序列的去噪
+            mot (MoT): Mixture-of-Transformers 混合注意力层，管理视频与动作专家的注意力路由
+            vae: VAE 模型，用于视频像素空间与隐空间之间的编码/解码
+            text_encoder: 文本编码器（可选），将文本提示编码为条件向量
+            tokenizer: 分词器（可选），配合 text_encoder 使用
+            text_dim (int, 可选): 文本/条件向量的特征维度。未指定时从 text_encoder 自动获取
+            proprio_dim (int, 可选): 本体感知向量的维度，非 None 时创建线性投影层
+            device (str): 计算设备，默认 "cpu"
+            torch_dtype (torch.dtype): 模型张量的数据类型，默认 torch.float32
+            video_train_shift (float): 视频训练 Flow Matching 调度器的 shift 参数
+            video_infer_shift (float): 视频推理 Flow Matching 调度器的 shift 参数
+            video_num_train_timesteps (int): 视频训练时间步数
+            action_train_shift (float): 动作训练 Flow Matching 调度器的 shift 参数
+            action_infer_shift (float): 动作推理 Flow Matching 调度器的 shift 参数
+            action_num_train_timesteps (int): 动作训练时间步数
+            loss_lambda_video (float): 视频损失项的权重系数
+            loss_lambda_action (float): 动作损失项的权重系数
+        """
         super().__init__()
         self.video_expert = video_expert
         self.action_expert = action_expert
         self.mot = mot
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
+        # 保留训练器兼容性：优化器和冻结逻辑使用 `model.dit` 属性指向 MoT
         self.dit = self.mot
 
         self.vae = vae
@@ -77,6 +133,7 @@ class FastWAM(torch.nn.Module):
             shift=action_infer_shift,
         )
         # Optional aliases for consistency with Wan22Core naming.
+        # 可选别名，与 Wan22Core 的命名保持一致
         self.train_scheduler = self.train_video_scheduler
         self.infer_scheduler = self.infer_video_scheduler
 
@@ -112,6 +169,37 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ):
+        """从预训练的 Wan2.2-TI2V-5B 检查点加载并构建 FastWAM 模型。
+
+        该工厂方法执行以下步骤：
+          1. 调用 load_wan22_ti2v_5b_components 加载视频专家（DiT）、VAE、文本编码器等组件
+          2. 从动作 DiT 配置和预训练路径加载 ActionDiT 专家
+          3. 校验视频专家与动作专家的 num_heads、attn_head_dim、num_layers 一致
+          4. 用两个专家构建 MoT 混合注意力层
+          5. 组装 FastWAM 实例并记录所有组件的模型路径
+
+        参数:
+            device (str): 目标设备，默认 "cuda"
+            torch_dtype (torch.dtype): 模型数据类型，默认 torch.bfloat16
+            model_id (str): HuggingFace 上的 Wan2.2-TI2V-5B 模型 ID
+            tokenizer_model_id (str): 分词器模型 ID
+            tokenizer_max_len (int): 分词器最大长度
+            load_text_encoder (bool): 是否加载文本编码器
+            proprio_dim (int, 可选): 本体感知维度
+            redirect_common_files (bool): 是否重定向公共文件
+            video_dit_config (dict, 可选): 视频 DiT 配置字典
+            action_dit_config (dict, 可选): 动作 DiT 配置字典
+            action_dit_pretrained_path (str, 可选): 动作 DiT 预训练权重路径
+            skip_dit_load_from_pretrain (bool): 是否跳过从预训练权重加载 DiT
+            mot_checkpoint_mixed_attn (bool): MoT 是否启用混合注意力梯度检查点
+            video_train_shift, video_infer_shift, video_num_train_timesteps: 视频调度器参数
+            action_train_shift, action_infer_shift, action_num_train_timesteps: 动作调度器参数
+            loss_lambda_video (float): 视频损失权重
+            loss_lambda_action (float): 动作损失权重
+
+        返回:
+            FastWAM: 构建完成的 FastWAM 模型实例
+        """
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
         if "text_dim" not in video_dit_config:
@@ -181,6 +269,13 @@ class FastWAM(torch.nn.Module):
         return model
 
     def to(self, *args, **kwargs):
+        """将模型及其子模块移动到指定设备/数据类型。
+
+        重载父类的 to 方法，确保 mot、text_encoder 和 vae 也同步移动。
+
+        参数:
+            *args, **kwargs: 传递给 torch.nn.Module.to() 的参数
+        """
         super().to(*args, **kwargs)
         self.mot.to(*args, **kwargs)
         if self.text_encoder is not None:
@@ -190,6 +285,20 @@ class FastWAM(torch.nn.Module):
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
+        """检查并调整视频的空间和时间维度至模型要求的对齐值。
+
+        模型要求：
+          - 高度和宽度为 16 的倍数
+          - 帧数满足 T % 4 == 1
+
+        参数:
+            height (int): 输入图像高度
+            width (int): 输入图像宽度
+            num_frames (int): 期望的视频帧数
+
+        返回:
+            tuple[int, int, int]: 调整后的 (height, width, num_frames)
+        """
         if height % 16 != 0:
             height = (height + 15) // 16 * 16
         if width % 16 != 0:
@@ -200,6 +309,17 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def encode_prompt(self, prompt: Union[str, Sequence[str]]):
+        """将文本提示编码为条件向量序列。
+
+        使用内部的分词器（tokenizer）和文本编码器（text_encoder）将原始文本转换为
+        密集向量表示。对 padding 位置进行清零处理以避免在 cross-attention 中产生伪影。
+
+        输入: prompt [batch_size] 或 [batch_size, ...]（字符串序列）
+        输出: prompt_emb [B, L, D], mask [B, L]
+              - B: batch_size
+              - L: token 序列长度
+              - D: text_dim 特征维度
+        """
         if self.text_encoder is None or self.tokenizer is None:
             raise ValueError(
                 "Prompt encoding requires loaded text encoder/tokenizer. "
@@ -210,6 +330,8 @@ class FastWAM(torch.nn.Module):
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
         # FIXME: original implementation's zero padding is visible in cross-attn.
+        # FIXME: 原始实现的零填充在 cross-attention 中可见
+        # 对 padding 位置显式清零，消除可能的信息泄露
         seq_lens = mask.gt(0).sum(dim=1).long()
         for i, v in enumerate(seq_lens):
             prompt_emb[i, v:] = 0
@@ -222,6 +344,12 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         proprio: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """将本体感知（Proprioception）编码为 token 并追加到条件上下文序列末尾。
+
+        输入: context [B, L, D], context_mask [B, L], proprio [B, D]
+        输出: new_context [B, L+1, D], new_mask [B, L+1]
+              - 在 context 末尾追加一个 proprio token，mask 相应扩展
+        """
         if self.proprio_encoder is None or proprio is None:
             return context, context_mask
         if proprio.ndim != 2:
@@ -230,9 +358,11 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}"
             )
+        # 通过线性投影层将 proprio 映射到文本特征空间
         proprio_token = self.proprio_encoder(
             proprio.to(device=self.device, dtype=context.dtype).unsqueeze(1)
         ).to(dtype=context.dtype) # [B, 1, D]
+        # 构建对应的 mask，proprio token 始终可见（非 padding）
         proprio_mask = torch.ones((context_mask.shape[0], 1), dtype=torch.bool, device=context_mask.device)
         return (
             torch.cat([context, proprio_token], dim=1),
@@ -241,6 +371,14 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        """将视频像素张量编码为 VAE 隐空间表示。
+
+        输入: video_tensor [B, 3, T, H, W]（像素值，归一化到 [-1, 1]）
+        输出: z [B, C, T_lat, H_lat, W_lat]
+              - C: VAE 隐空间通道数
+              - T_lat = (T - 1) // temporal_downsample_factor + 1
+              - H_lat = H // upsampling_factor, W_lat = W // upsampling_factor
+        """
         z = self.vae.encode(
             video_tensor,
             device=self.device,
@@ -252,6 +390,13 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        """将单张条件输入图像编码为 VAE 隐空间表示。
+
+        用于推理时提供视频生成的首帧条件。
+
+        输入: input_image [1, 3, H, W] 或 [3, H, W]（像素值）
+        输出: z [1, C, 1, H_lat, W_lat]（单帧隐空间表示）
+        """
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
@@ -265,6 +410,12 @@ class FastWAM(torch.nn.Module):
         return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        """将 VAE 隐空间张量解码为 PIL 图像帧列表。
+
+        输入: latents [1, C, T_lat, H_lat, W_lat]
+        输出: list[Image] — 长度 = T_lat（解码后逐帧的 PIL 图像列表）
+              每张图像尺寸: (H, W)，三通道 RGB
+        """
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
         video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
@@ -275,6 +426,35 @@ class FastWAM(torch.nn.Module):
         return frames
 
     def build_inputs(self, sample, tiled: bool = False):
+        """从数据样本构建模型训练/推理所需的所有输入张量。
+
+        该函数执行以下步骤：
+          1. 校验视频张量的维度（必须为 [B, 3, T, H, W]）
+          2. 校验视频帧数满足 T % 4 == 1，空间维度满足 16 的倍数
+          3. 校验动作张量维度为 [B, T_a, D_a]
+          4. 将视频像素编码为 VAE 隐空间张量
+          5. 处理条件上下文（context）和可选的本体感知（proprio）编码
+          6. 检查动作 padding mask（action_is_pad）和图像 padding mask（image_is_pad）的维度
+
+        输入 sample 的键:
+          - "video" [B, 3, T, H, W]: 视频像素张量
+          - "context" [B, L, D]: 条件上下文嵌入
+          - "context_mask" [B, L]: 上下文 mask
+          - "action" [B, T_a, a_dim]: 动作序列（T_a 应为 (T-1) 的整数倍）
+          - "proprio" [B, T, d], 可选: 本体感知序列
+          - "action_is_pad" [B, T_a], 可选: 动作的 padding 标记
+          - "image_is_pad" [B, T], 可选: 视频帧的 padding 标记
+
+        输出 dict 的键:
+          - "context" [B, L', D]: 处理后的条件上下文（可能含 proprio token）
+          - "context_mask" [B, L']: 对应的 mask
+          - "input_latents" [B, C, T_lat, H_lat, W_lat]: VAE 编码后的视频隐空间张量
+          - "first_frame_latents" [B, C, 1, H_lat, W_lat]: 首帧隐空间表示（用于 fuse）
+          - "fuse_vae_embedding_in_latents" (bool): 是否在隐空间中融合 VAE 首帧嵌入
+          - "action" [B, T_a, a_dim]: 动作张量
+          - "action_is_pad" [B, T_a], 可选
+          - "image_is_pad" [B, T], 可选
+        """
         video = sample["video"]
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError(
@@ -333,12 +513,13 @@ class FastWAM(torch.nn.Module):
                     "`sample['image_is_pad']` shape mismatch: "
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
-        
+
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
         first_frame_latents = None
         fuse_flag = False
+        # 如果 DiT 配置了融合 VAE 首帧嵌入，则保留首帧隐变量
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
             first_frame_latents = input_latents[:, :, 0:1]
             fuse_flag = True
@@ -358,6 +539,7 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
+            # 取序列中第一个 proprio 作为全局条件
             proprio = proprio[:, 0, :] # [B, D]
             context, context_mask = self._append_proprio_to_context(
                 context=context,
@@ -390,6 +572,23 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """构建 MoT 混合注意力的注意力掩码矩阵。
+
+        控制视频 token 和动作 token 之间的注意力可见性：
+          - video -> video: 使用视频专家的视频到视频注意力掩码（通常是 causal 模式）
+          - action -> action: 完全可见（全 1）
+          - action -> video: 仅能关注视频序列的首帧 token（前 video_tokens_per_frame 个）
+
+        参数:
+            video_seq_len (int): 视频 token 总数
+            action_seq_len (int): 动作 token 总数
+            video_tokens_per_frame (int): 每帧对应的视频 token 数量
+            device: 目标设备
+
+        返回:
+            mask [total_seq_len, total_seq_len] 布尔张量，True 表示允许注意力
+              total_seq_len = video_seq_len + action_seq_len
+        """
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
 
@@ -402,6 +601,7 @@ class FastWAM(torch.nn.Module):
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
         # action -> first-frame video only
+        # 动作 token 仅能关注视频的首帧 token（前 tokens_per_frame 个）
         first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
         mask[video_seq_len:, :first_frame_tokens] = True
         return mask
@@ -413,10 +613,26 @@ class FastWAM(torch.nn.Module):
         image_is_pad: Optional[torch.Tensor],
         include_initial_video_step: bool,
     ) -> torch.Tensor:
+        """逐样本计算视频损失，支持基于 padding 的 masked reduction。
+
+        对每个样本，计算所有空间位置的 MSE 后按帧平均，然后根据 image_is_pad
+        排除 padding 帧，最终在有效帧上取平均。
+
+        输入:
+            pred_video [B, C, T_lat, H_lat, W_lat]: 预测的视频噪声/目标
+            target_video [B, C, T_lat, H_lat, W_lat]: 真实视频噪声/目标
+            image_is_pad [B, T] 或 None: 输入视频帧的 padding 标记
+            include_initial_video_step (bool): 是否将视频首帧计入损失
+
+        返回:
+            loss [B]: 每个样本的视频损失标量
+        """
+        # 计算逐 token 的 MSE 损失，然后在通道和空间维度平均
         video_loss_token = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").mean(dim=(1, 3, 4))
         if image_is_pad is None:
             return video_loss_token.mean(dim=1)
 
+        # 根据 VAE 的时间下采样因子，将帧级 padding 映射到隐空间时间步
         temporal_factor = int(self.vae.temporal_downsample_factor)
         if temporal_factor <= 0:
             raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}.")
@@ -428,7 +644,9 @@ class FastWAM(torch.nn.Module):
                 f"num_frames={image_is_pad.shape[1]}, temporal_downsample_factor={temporal_factor}."
             )
 
+        # 排除首帧，将剩余帧分组为隐空间时间步
         tail_is_pad = image_is_pad[:, 1:]
+        # 若一个隐时间步对应的所有帧都是 padding，则该时间步为 padding
         latent_tail_is_pad = tail_is_pad.view(image_is_pad.shape[0], -1, temporal_factor).all(dim=2)
         if include_initial_video_step:
             video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
@@ -441,11 +659,31 @@ class FastWAM(torch.nn.Module):
                 f"mask steps={video_is_pad.shape[1]}, loss steps={video_loss_token.shape[1]}."
             )
 
+        # 在有效（非 padding）帧上计算平均 loss
         valid = (~video_is_pad).to(device=video_loss_token.device, dtype=video_loss_token.dtype)
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
     def training_loss(self, sample, tiled: bool = False):
+        """计算单个 batch 的联合训练损失（视频 + 动作）。
+
+        训练流程：
+          1. 调用 build_inputs 处理输入样本，得到隐空间表示、条件和动作张量
+          2. 对视频隐空间张量加噪（Flow Matching 调度器），得到加噪视频和训练目标
+          3. 对动作张量加噪（Flow Matching 调度器），得到加噪动作和训练目标
+          4. 视频和动作分别通过各自的 pre_dit 编码为 token 序列
+          5. 构建 MoT 混合注意力掩码，通过 MoT 层进行跨模态注意力交互
+          6. 分别通过 post_dit 得到预测的噪声/目标
+          7. 计算视频损失（支持 image_is_pad masked reduction）和动作损失
+          8. 合并为总损失，返回 loss_dict 包含各分量
+
+        输入: sample (dict) — 包含 video, context, context_mask, action 等键值
+              tiled (bool): VAE 编码是否使用分块处理
+
+        输出: (loss_total, loss_dict)
+              loss_total (Tensor): 标量总损失
+              loss_dict (dict): {"loss_video": float, "loss_action": float}
+        """
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -455,6 +693,7 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
+        # --- 视频分支加噪 ---
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -464,9 +703,11 @@ class FastWAM(torch.nn.Module):
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
+        # 如果配置了 fuse 首帧，对首帧隐变量保持不变（不加噪）
         if inputs["first_frame_latents"] is not None:
             latents[:, :, 0:1] = inputs["first_frame_latents"]
 
+        # --- 动作分支加噪 ---
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -476,6 +717,7 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
+        # --- 视频和动作分别经过 pre_dit ---
         video_pre = self.video_expert.pre_dit(
             x=latents,
             timestep=timestep_video,
@@ -495,6 +737,7 @@ class FastWAM(torch.nn.Module):
         video_tokens = video_pre["tokens"]
         action_tokens = action_pre["tokens"]
 
+        # --- 构建混合注意力掩码，执行 MoT 交互 ---
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_tokens.shape[1],
             action_seq_len=action_tokens.shape[1],
@@ -527,12 +770,14 @@ class FastWAM(torch.nn.Module):
             },
         )
 
+        # --- post_dit 重建 ---
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
+        # --- 视频损失计算 ---
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
+            # 如果首帧被 fuse 了，则排除首帧的预测（首帧已知无损失）
             pred_video = pred_video[:, :, 1:]
             target_video = target_video[:, :, 1:]
 
@@ -542,11 +787,13 @@ class FastWAM(torch.nn.Module):
             image_is_pad=image_is_pad,
             include_initial_video_step=include_initial_video_step,
         )
+        # Flow Matching 训练权重（根据时间步调整不同噪声水平的贡献）
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
             loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
+        # --- 动作损失计算 ---
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
         if action_is_pad is not None:
             valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
@@ -560,6 +807,7 @@ class FastWAM(torch.nn.Module):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
+        # --- 合并总损失 ---
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
@@ -579,6 +827,22 @@ class FastWAM(torch.nn.Module):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """推理时联合预测视频和动作的噪声（Flow Matching 预测）。
+
+        输入:
+            latents_video [1, C, T_lat, H_lat, W_lat]: 当前视频隐空间张量
+            latents_action [1, T, a_dim]: 当前动作噪声张量
+            timestep_video [1]: 视频当前时间步
+            timestep_action [1]: 动作当前时间步
+            context [1, L, D]: 文本/条件上下文
+            context_mask [1, L]: 上下文 mask
+            fuse_vae_embedding_in_latents (bool): 是否融合 VAE 首帧嵌入
+            gt_action [1, T, a_dim], 可选: 用于视频专家交叉注意力的真实动作（训练时）或 None
+
+        输出:
+            pred_video [1, C, T_lat, H_lat, W_lat]: 视频专家预测的噪声
+            pred_action [1, T, a_dim]: 动作专家预测的噪声
+        """
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -641,6 +905,24 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
     ) -> torch.Tensor:
+        """推理时仅预测动作噪声（视频侧使用首帧条件，视频时间步设为 0）。
+
+        视频专家以首帧隐变量为输入，时间步为 0，action 为 None，
+        这意味着视频专家在此处仅作为视觉条件编码器，不进行去噪。
+        动作专家正常进行去噪预测。
+
+        输入:
+            first_frame_latents [1, C, 1, H_lat, W_lat]: 首帧隐空间张量（已知，无噪声）
+            latents_action [1, T, a_dim]: 当前加噪的动作张量
+            timestep_action [1]: 动作当前时间步
+            context [1, L, D]: 文本/条件上下文
+            context_mask [1, L]: 上下文 mask
+            fuse_vae_embedding_in_latents (bool): 是否融合 VAE 首帧嵌入
+
+        输出:
+            pred_action [1, T, a_dim]: 动作专家预测的噪声
+        """
+        # 视频侧时间步设为 0（无噪声），仅提供视觉条件
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
         video_pre = self.video_expert.pre_dit(
             x=first_frame_latents,
@@ -702,12 +984,30 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:
+        """使用视频 KV 缓存高效地预测动作噪声。
+
+        在动作推理场景中，视频侧的 token 处理只需进行一次（预填充 KV 缓存），
+        后续动作去噪迭代可直接复用缓存的视频 K/V，避免重复计算视频 self-attention。
+
+        输入:
+            latents_action [1, T, a_dim]: 当前加噪的动作张量
+            timestep_action [1]: 动作当前时间步
+            context [1, L, D]: 条件上下文
+            context_mask [1, L]: 上下文 mask
+            video_kv_cache (list[dict]): 预填充的视频 KV 缓存，与 MoT 的层一一对应
+            attention_mask [total_seq_len, total_seq_len]: 完整注意力掩码
+            video_seq_len (int): 视频 token 总数
+
+        输出:
+            pred_action [1, T, a_dim]: 动作专家预测的噪声
+        """
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
         )
+        # 通过 MoT 的 forward_action_with_video_cache 复用视频 KV 缓存
         action_tokens = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
             action_freqs=action_pre["freqs"],
@@ -742,6 +1042,40 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
     ) -> dict[str, Any]:
+        """联合视频-动作推理（同步去噪）。
+
+        推理流程：
+          1. （可选）若 test_action_with_infer_action=True，先调用 infer_action 得到纯动作推理结果用于对比
+          2. 校验输入图像维度，检查尺寸对齐要求
+          3. 编码输入图像首帧为 VAE 隐空间张量
+          4. 生成初始随机噪声：视频 [1,C,T_lat,H_lat,W_lat] 和动作 [1,T,a_dim]
+          5. 构建条件上下文（从 prompt 编码或从预计算 context 获取）
+          6. 构建视频和动作的推理时间表（Flow Matching 调度器）
+          7. 逐步去噪：每一步联合预测视频和动作噪声，执行调度器步进
+          8. 保持首帧隐变量在整个去噪过程中不变（条件帧约束）
+          9. 解码视频隐空间为 PIL 帧序列，返回动作结果
+
+        参数:
+            prompt (str, 可选): 文本提示（与 context/context_mask 互斥）
+            input_image [1, 3, H, W] 或 [3, H, W]: 条件首帧图像
+            num_video_frames (int): 要生成的视频总帧数（需满足 T % 4 == 1）
+            action_horizon (int): 动作序列长度
+            action [1, T, a_dim], 可选: 用于视频条件化的参考动作（非动作专家输入）
+            proprio [1, D] 或 [D], 可选: 本体感知编码
+            context [1, L, D], 可选: 预编码的条件上下文（与 prompt 互斥）
+            context_mask [1, L], 可选: 上下文 mask
+            negative_prompt (str, 可选): 负向提示（当前未使用）
+            text_cfg_scale (float): 文本 CFG 缩放（当前未使用）
+            num_inference_steps (int): 推理去噪步数
+            sigma_shift (float, 可选): 调度器 sigma shift 覆盖值
+            seed (int, 可选): 随机种子
+            rand_device (str): 生成随机数的设备
+            tiled (bool): VAE 是否使用分块处理
+            test_action_with_infer_action (bool): 是否与纯动作推理结果对比校验
+
+        返回:
+            dict: {"video": list[Image], "action": Tensor [T, a_dim]}
+        """
         self.eval()
         if test_action_with_infer_action:
             if seed is None:
@@ -759,7 +1093,7 @@ class FastWAM(torch.nn.Module):
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
             )["action"]
-        
+
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
@@ -798,10 +1132,12 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
+        # 计算隐空间维度
         latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
+        # 生成初始随机噪声
         video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
@@ -817,11 +1153,13 @@ class FastWAM(torch.nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
+        # 编码首帧并替换视频噪声的首帧位置
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
+        # 处理条件上下文
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -851,6 +1189,7 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
+        # 构建视频和动作的推理时间调度表
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -863,6 +1202,7 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        # 逐步去噪循环：视频和动作同步步进
         for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
             infer_timesteps_video,
             infer_deltas_video,
@@ -887,6 +1227,7 @@ class FastWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            # 每次步进后恢复首帧为条件帧（防止首帧被噪声污染）
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
@@ -919,6 +1260,38 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
     ) -> dict[str, Any]:
+        """仅推理动作序列（利用视频 KV 缓存加速）。
+
+        此方法将视频侧作为固定条件（首帧），通过视频 KV 缓存破解（prefill）实现一次计算、
+        多次复用的高效推理。动作侧的每个去噪步只需计算动作 token 的自注意力和
+        对视频缓存的交叉注意力，无需重新计算视频 token。
+
+        推理流程：
+          1. 编码首帧图像为 VAE 隐变量
+          2. 视频专家以首帧和时间步 0 为输入，经 pre_dit 编码
+          3. 预填充视频 KV 缓存（prefill_video_cache）
+          4. 构建注意力掩码（动作可关注首帧视频）
+          5. 动作去噪循环：每步通过 _predict_action_noise_with_cache 预测噪声
+          6. 调度器步进更新动作张量
+
+        参数:
+            prompt (str, 可选): 文本提示（与 context/context_mask 互斥）
+            input_image [1, 3, H, W] 或 [3, H, W]: 条件首帧图像
+            action_horizon (int): 动作序列长度
+            proprio [1, D] 或 [D], 可选: 本体感知编码
+            context [1, L, D], 可选: 预编码的上下文（与 prompt 互斥）
+            context_mask [1, L], 可选: 上下文 mask
+            negative_prompt (str, 可选): 负向提示（当前未使用）
+            text_cfg_scale (float): 文本 CFG 缩放（当前未使用）
+            num_inference_steps (int): 推理去噪步数
+            sigma_shift (float, 可选): 调度器 shift 覆盖
+            seed (int, 可选): 随机种子
+            rand_device (str): 生成随机数的设备
+            tiled (bool): VAE 是否使用分块处理
+
+        返回:
+            dict: {"action": Tensor [T, a_dim]}
+        """
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
@@ -949,6 +1322,7 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
+        # 生成动作初始噪声
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_action = torch.randn(
             (1, action_horizon, self.action_expert.action_dim),
@@ -961,6 +1335,7 @@ class FastWAM(torch.nn.Module):
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
+        # 条件上下文处理
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
@@ -990,6 +1365,7 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
+        # 视频预填充：编码首帧并预计算 KV 缓存
         timestep_video = torch.zeros(
             (first_frame_latents.shape[0],),
             dtype=first_frame_latents.dtype,
@@ -1010,6 +1386,7 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
         )
+        # 预填充视频 KV 缓存，后续动作去噪步可直接复用
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
             video_freqs=video_pre["freqs"],
@@ -1021,12 +1398,14 @@ class FastWAM(torch.nn.Module):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
+        # 构建动作推理时间调度表
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        # 动作去噪循环
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
@@ -1067,6 +1446,30 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
     ):
+        """FastWAM 推理入口，封装调用 infer_joint。
+
+        作为 infer_joint 的简便别名，兼容 Wan22Core 的 infer 接口签名。
+
+        参数:
+            prompt (str, 可选): 文本提示
+            input_image [1, 3, H, W]: 条件首帧图像
+            num_frames (int): 要生成的视频总帧数
+            action [1, T, a_dim], 可选: 视频条件动作
+            action_horizon (int, 可选): 动作序列长度
+            proprio [D], 可选: 本体感知
+            context/context_mask: 可选的条件上下文
+            negative_prompt (str, 可选): 负向提示
+            text_cfg_scale (float): 文本 CFG 缩放
+            action_cfg_scale (float): 动作 CFG 缩放（当前未使用）
+            num_inference_steps (int): 推理步数
+            sigma_shift (float, 可选): 调度器 shift 覆盖
+            seed (int, 可选): 随机种子
+            rand_device (str): 随机数生成设备
+            tiled (bool): VAE 分块处理
+
+        返回:
+            dict: {"video": list[Image], "action": Tensor [T, a_dim]}
+        """
         return self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -1086,6 +1489,20 @@ class FastWAM(torch.nn.Module):
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):
+        """保存模型检查点到磁盘。
+
+        保存内容包括：
+          - MoT（包括 video_expert 和 action_expert）的状态字典
+          - 当前训练步数
+          - 模型数据类型
+          - 优化器状态（可选）
+          - proprio_encoder 权重（如启用）
+
+        参数:
+            path (str): 保存路径
+            optimizer: PyTorch 优化器（可选）
+            step (int): 当前训练步数（可选）
+        """
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
@@ -1098,6 +1515,18 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
+        """从磁盘加载模型检查点。
+
+        支持向后兼容：优先加载 "mot" 键（MoT 整体），
+        如不存在则尝试加载 "dit" 键（仅视频专家，旧版格式）。
+
+        参数:
+            path (str): 检查点路径
+            optimizer: PyTorch 优化器实例（可选，将更新其状态）
+
+        返回:
+            payload (dict): 从检查点加载的原始字典
+        """
         payload = torch.load(path, map_location="cpu")
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
@@ -1119,4 +1548,9 @@ class FastWAM(torch.nn.Module):
         return payload
 
     def forward(self, *args, **kwargs):
+        """前向传播。默认调用 training_loss。
+
+        参数:
+            *args, **kwargs: 传递给 training_loss 的参数
+        """
         return self.training_loss(*args, **kwargs)

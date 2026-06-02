@@ -9,7 +9,7 @@ ckpt: null
 gpu_id: 0
 
 model:
-  load_text_encoder: true
+  load_text_encoder: false
   skip_dit_load_from_pretrain: true
   action_dit_pretrained_path: null
 
@@ -38,6 +38,7 @@ EVALUATION:
 
   # Optional external inputs
   dataset_stats_path: null
+  text_embedding_cache_dir: ./checkpoints/libero_text_embeds
   device: cuda
 
 MULTIRUN:

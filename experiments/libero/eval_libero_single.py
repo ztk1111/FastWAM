@@ -1,3 +1,29 @@
+"""
+FastWAM LIBERO 单任务评估模块 (eval_libero_single)。
+
+该模块是 FastWAM 模型在 LIBERO 仿真环境中的单任务评估入口，核心功能：
+1. 模型加载与初始化：加载 FastWAM 检查点、数据处理器和归一化器。
+2. 观测处理：将 LIBERO 环境的观测（多摄像头图像、本体感知状态）
+   转换为模型输入格式（图像拼接/裁剪、状态归一化）。
+3. 动作推理与执行：调用扩散模型推理生成动作块，支持反归一化、
+   gripper 动作翻转和动作集成 (ActionEnsembler)。
+4. 逐 episode 评估：运行多个 episode，记录成功率/失败信息/重放视频。
+5. 未来视频预测与 PSNR 评估：支持可视化预测的未来视频帧并计算 PSNR。
+
+与 RoboTwin 策略相比，LIBERO 评估的不同点：
+- 使用 LIBERO 的 benchmark API 获取任务和初始状态。
+- 图像来自 agentview 和 wrist 两个摄像头，支持水平和垂直拼接。
+- 动作空间包含 7 维控制（6-DoF 末端执行器位姿 + 夹爪）。
+
+使用示例:
+    python experiments/libero/eval_libero_single.py \
+        ckpt=/path/to/ckpt.pt \
+        EVALUATION.task_suite_name=libero_spatial \
+        EVALUATION.task_id=0 \
+        EVALUATION.num_trials=10 \
+        EVALUATION.output_dir=/tmp/eval_results
+"""
+
 import json
 import inspect
 import logging
@@ -50,6 +76,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class NumpyEncoder(json.JSONEncoder):
+    """自定义 JSON 编码器，支持 numpy 数据类型序列化。
+
+    将 numpy 的整数、浮点数和数组类型自动转换为 Python 原生类型，
+    避免 json.dump 时出现 TypeError。
+    """
     def default(self, obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -61,6 +92,19 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
+    """规范化混合精度配置字符串，验证合法性。
+
+    支持的精度选项: "no" (全精度 fp32)、"fp16" (半精度)、"bf16" (bfloat16)。
+
+    Args:
+        mixed_precision: 混合精度配置字符串。
+
+    Returns:
+        str: 规范化后的精度标识。
+
+    Raises:
+        ValueError: 不支持的精度选项。
+    """
     key = str(mixed_precision).strip().lower()
     if key not in {"no", "fp16", "bf16"}:
         raise ValueError(
@@ -71,6 +115,14 @@ def _normalize_mixed_precision(mixed_precision: str) -> str:
 
 
 def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
+    """将混合精度配置转换为 PyTorch 数据类型。
+
+    Args:
+        mixed_precision: 混合精度配置字符串。
+
+    Returns:
+        torch.dtype: 对应的 PyTorch 数据类型。
+    """
     precision = _normalize_mixed_precision(mixed_precision)
     if precision == "no":
         return torch.float32
@@ -80,6 +132,17 @@ def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
 
 
 def _resolve_eval_device(cfg: DictConfig) -> str:
+    """解析评估设备（GPU/CPU）。
+
+    优先使用配置中的 EVALUATION.device，
+    未指定时自动检测：CUDA 可用则用 "cuda"，否则用 "cpu"。
+
+    Args:
+        cfg: Hydra 配置对象。
+
+    Returns:
+        str: 设备字符串 ("cuda" 或 "cpu")。
+    """
     eval_device = cfg.EVALUATION.get("device")
     if eval_device is not None:
         return str(eval_device)
@@ -87,12 +150,28 @@ def _resolve_eval_device(cfg: DictConfig) -> str:
 
 
 def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
+    """解析数据集统计文件 (dataset_stats.json) 的路径。
+
+    搜索顺序:
+        1. 配置中显式指定的 EVALUATION.dataset_stats_path。
+        2. 检查点路径的父目录（向上最多 4 层）。
+
+    Args:
+        cfg: Hydra 配置对象。
+
+    Returns:
+        Path: 找到的 dataset_stats.json 路径。
+
+    Raises:
+        FileNotFoundError: 在所有候选位置都未找到时抛出。
+    """
     explicit = cfg.EVALUATION.get("dataset_stats_path")
     candidates: list[Path] = []
 
     if explicit is not None:
         candidates.append(Path(os.path.expanduser(os.path.expandvars(str(explicit)))))
 
+    # 在检查点的父目录中搜索
     ckpt = Path(os.path.expanduser(os.path.expandvars(str(cfg.ckpt))))
     for parent in list(ckpt.parents)[:4]:
         candidates.append(parent / "dataset_stats.json")
@@ -115,11 +194,20 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
 
 
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
+    """加载模型检查点。
+
+    优先使用模型的 load_checkpoint 方法（新格式），
+    后续的旧格式加载代码仅为向后兼容保留（dead code）。
+
+    Args:
+        model: PyTorch 模型实例。
+        ckpt: 检查点文件路径。
+    """
     model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
     return
 
-    # deprecated legacy checkpoint loading
+    # ======== 废弃的旧版检查点加载逻辑 (向后兼容) ========
     payload = torch.load(ckpt, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
@@ -153,6 +241,25 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
 
 
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    """对图像进行中心裁剪并调整到目标尺寸。
+
+    保持图像宽高比，先等比放大至覆盖目标尺寸，然后中心裁剪。
+    这种方法可以在不严重扭曲图像的前提下将图像调整为任意尺寸。
+
+    Args:
+        image: 输入图像，形状为 [H, W, 3]。
+        width: 目标宽度。
+        height: 目标高度。
+
+    Returns:
+        np.ndarray: 裁剪并调整后的图像，形状为 [height, width, 3]。
+
+    示例:
+        >>> img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+        >>> out = _center_crop_resize(img, 224, 224)
+        >>> out.shape
+        (224, 224, 3)
+    """
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
     scale = max(width / src_w, height / src_h)
@@ -168,6 +275,18 @@ def _normalize_proprio(
     proprio: np.ndarray,
     processor: FastWAMProcessor,
 ) -> torch.Tensor:
+    """对机器人的本体感知状态（proprioception）进行归一化。
+
+    使用数据集统计信息对末端执行器位姿和夹爪状态进行归一化，
+    使其适合作为扩散模型的条件输入。
+
+    Args:
+        proprio: 原始状态向量，形状为 [D]（D=7: 6-DoF 位姿 + 1 夹爪）。
+        processor: FastWAM 数据处理器，包含归一化器。
+
+    Returns:
+        torch.Tensor: 归一化后的状态张量，形状为 [1, D]。
+    """
     state_meta = processor.shape_meta["state"]
     if len(state_meta) != 1:
         raise ValueError(
@@ -190,6 +309,33 @@ def _obs_to_model_input(
     device: str,
     dtype: torch.dtype,
 ):
+    """将 LIBERO 环境观测转换为模型输入。
+
+    处理流程:
+        1. 从观测中提取 agentview 和 wrist 图像。
+        2. 根据处理器配置的摄像头数量，对图像进行中心裁剪和 resize。
+        3. 多摄像头图像拼接（支持水平/垂直拼接）。
+        4. 转换为 CHW 格式张量，归一化到 [-1, 1]。
+        5. 提取并归一化本体感知状态。
+
+    Args:
+        obs: LIBERO 环境观测字典。
+        cfg: Hydra 配置。
+        processor: FastWAM 数据处理器。
+        width: 输入图像宽度。
+        height: 输入图像高度。
+        device: 张量所在设备。
+        dtype: 张量数据类型。
+
+    Returns:
+        tuple: (image_tensor, proprio_tensor, raw_images)
+            - image_tensor: 形状 [1, C, H, W] 的图像张量。
+            - proprio_tensor: 形状 [1, D] 的归一化状态张量。
+            - raw_images: 包含原始图像字典（用于视频保存）。
+
+    Raises:
+        ValueError: 摄像头数量或图像尺寸不匹配时抛出。
+    """
     imgs = get_libero_image(obs)
     image_meta = processor.shape_meta["images"]
     if len(image_meta) < int(processor.num_output_cameras):
@@ -199,6 +345,7 @@ def _obs_to_model_input(
         )
 
     def _meta_to_hw(meta: dict, camera_idx: int) -> tuple[int, int]:
+        """从 shape_meta 中提取图像尺寸 (H, W)。"""
         shape = meta["shape"]
         if len(shape) != 3:
             raise ValueError(f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}")
@@ -242,9 +389,21 @@ def _obs_to_model_input(
 
 
 def _extract_sim_state(obs: dict) -> np.ndarray:
-    """Build simulator state from current observation.
+    """从当前观测中提取仿真器状态，作为模型的本体感知输入。
 
-    This is used as proprio input for model inference.
+    拼接末端执行器位置 (3)、旋转 (3, axis-angle)、夹爪开合 (1)，
+    总共 7 维状态向量。
+
+    Args:
+        obs: LIBERO 环境观测字典。
+
+    Returns:
+        np.ndarray: 形状为 [7] 的状态向量，dtype=float32。
+
+    输出示例:
+        >>> state = _extract_sim_state(obs)
+        >>> state.shape
+        (7,)  # [eef_x, eef_y, eef_z, ax, ay, az, gripper_qpos]
     """
     state = np.concatenate(
         (
@@ -257,6 +416,20 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
 
 
 def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
+    """对模型输出的动作张量进行反归一化。
+
+    将归一化的动作恢复到原始物理量纲，以便在仿真环境中执行。
+
+    Args:
+        action: 归一化动作张量，形状 [B, T, D] 或 [T, D]。
+        processor: FastWAM 数据处理器，包含动作归一化器。
+
+    Returns:
+        np.ndarray: 反归一化后的动作数组，形状 [B, T, D]。
+
+    Raises:
+        ValueError: 动作张量维度不合法时抛出。
+    """
     if action.ndim == 2:
         action = action.unsqueeze(0)
     if action.ndim != 3:
@@ -276,10 +449,31 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
 
 
 def _get_num_video_frames(cfg: DictConfig) -> int:
+    """计算模型需要的视频帧数量。
+
+    根据训练配置中的总帧数和动作视频采样频率比计算。
+
+    Args:
+        cfg: Hydra 配置。
+
+    Returns:
+        int: 视频帧数。
+    """
     return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
 
 
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
+    """验证未来视频可视化配置的合法性。
+
+    如果启用 visualize_future_video，要求模型配置中
+    video_dit_config.action_conditioned 必须为 false。
+
+    Args:
+        cfg: Hydra 配置。
+
+    Raises:
+        ValueError: 配置冲突时抛出。
+    """
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
 
@@ -292,6 +486,17 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
 
 
 def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConfig) -> list[Image.Image]:
+    """从模型预测的未来视频帧中选择需要保留的帧。
+
+    根据 replan_steps 和 action_video_freq_ratio 确定要保留的帧数。
+
+    Args:
+        pred_video: 模型预测的未来视频帧列表。
+        cfg: Hydra 配置。
+
+    Returns:
+        list[Image.Image]: 筛选后的帧列表。
+    """
     if len(pred_video) == 0:
         raise ValueError("`infer_joint` returned an empty predicted video.")
 
@@ -303,6 +508,14 @@ def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConf
 
 
 def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
+    """计算需要捕获未来帧的仿真步数列表。
+
+    Args:
+        cfg: Hydra 配置。
+
+    Returns:
+        list[int]: 需要捕获未来帧的仿真步数索引列表。
+    """
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
     num_future_frames = replan_steps // action_video_freq_ratio
@@ -310,6 +523,19 @@ def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
 
 
 def _frame_to_rgb_array(frame: Any) -> np.ndarray:
+    """将多种格式的帧数据统一转换为 RGB numpy 数组。
+
+    支持:
+        - dict: 多摄像头图像的水平拼接。
+        - PIL Image: 直接转换为 numpy 数组。
+        - 其他: 尝试直接转为 numpy 数组。
+
+    Args:
+        frame: 帧数据，可以是 dict、PIL Image 或 numpy 数组。
+
+    Returns:
+        np.ndarray: RGB 图像数组，形状 [H, W, 3]。
+    """
     if isinstance(frame, dict):
         images = []
         for value in frame.values():
@@ -326,6 +552,19 @@ def _compute_clip_mean_psnr(
     pred_frames: list[Any],
     eps: float = 1e-8,
 ) -> Optional[float]:
+    """计算一组预测帧与真实帧之间的平均 PSNR（峰值信噪比）。
+
+    PSNR 衡量预测帧的图像质量，值越高表示预测越接近真实。
+    先计算每帧的 PSNR，再取平均。
+
+    Args:
+        gt_frames: 真实帧列表（来自仿真环境）。
+        pred_frames: 预测帧列表（来自模型）。
+        eps: 防止除零的小常数。
+
+    Returns:
+        Optional[float]: 平均 PSNR 值 (dB)，若输入为空则返回 None。
+    """
     if len(gt_frames) == 0 or len(pred_frames) == 0:
         return None
     assert len(gt_frames) == len(pred_frames), (
@@ -356,6 +595,40 @@ def _compute_clip_mean_psnr(
     return float(np.mean(frame_psnr_values))
 
 
+def _load_cached_text_context(prompt: str, *, cache_dir: str, context_len: int = 128):
+    """从预计算缓存加载 T5 文本嵌入（复用训练数据集相同的 hash 查找逻辑）。
+
+    与 robot_video_dataset._get_cached_text_context 使用完全一致的
+    缓存文件命名和格式约定，无需加载 T5 模型到 GPU。
+
+    Args:
+        prompt: 格式化后的完整提示词字符串。
+        cache_dir: 文本嵌入缓存目录路径。
+        context_len: token 序列长度，需与预编码时一致。
+
+    Returns:
+        tuple: (context [L, 4096], context_mask [L])
+    """
+    import hashlib
+    hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    # enc_id 与训练预编码保持一致
+    enc_id = "wan22ti2v5b"
+    cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{context_len}.{enc_id}.pt")
+    if not os.path.isfile(cache_path):
+        raise FileNotFoundError(
+            f"Cached text embedding not found: {cache_path}. "
+            f"Run: python scripts/precompute_libero_text_embeds.py --output-dir {cache_dir}"
+        )
+    payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+    context = payload["context"]
+    context_mask = payload["mask"].bool()
+    # Keep eval consistent with RobotVideoDataset: Wan-style text conditioning
+    # zeroes padded token embeddings but keeps all text positions visible.
+    context[~context_mask] = 0.0
+    context_mask = torch.ones_like(context_mask)
+    return context, context_mask
+
+
 def _predict_action_chunk(
     obs: dict,
     task_description: str,
@@ -367,7 +640,35 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    cached_context: Optional[torch.Tensor] = None,
+    cached_context_mask: Optional[torch.Tensor] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
+    """执行单次完整推理，生成动作块 (action chunk)。
+
+    处理流程:
+        1. 从配置中获取推理步数等推理参数。
+        2. 格式化语言指令提示词。
+        3. 将观测转换为模型输入（图像 + 状态）。
+        4. 调用模型推理（支持未来视频联合预测）。
+        5. 反归一化并后处理动作（gripper 符号翻转）。
+
+    Args:
+        obs: LIBERO 环境观测。
+        task_description: 自然语言任务描述。
+        model: FastWAM 模型。
+        processor: 数据处理器。
+        cfg: Hydra 配置。
+        action_horizon: 动作块长度。
+        input_w: 输入图像宽度。
+        input_h: 输入图像高度。
+        model_device: 模型所在设备。
+
+    Returns:
+        tuple: (action_chunk, images, predicted_future_frames)
+            - action_chunk: 形状 [T, D] 的反归一化动作数组。
+            - images: 原始观测图像字典。
+            - predicted_future_frames: 预测的未来帧列表（若启用可视化）或 None。
+    """
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -387,7 +688,6 @@ def _predict_action_chunk(
     )
 
     infer_kwargs = {
-        "prompt": prompt,
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -403,6 +703,13 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    # 优先使用缓存的 text embedding（无需 T5 在 GPU 上）
+    if cached_context is not None and cached_context_mask is not None:
+        infer_kwargs["prompt"] = None
+        infer_kwargs["context"] = cached_context.unsqueeze(0).to(device=model_device)
+        infer_kwargs["context_mask"] = cached_context_mask.unsqueeze(0).to(device=model_device)
+    else:
+        infer_kwargs["prompt"] = prompt
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -430,6 +737,21 @@ def _predict_action_chunk(
 
 
 def _get_max_steps(task_suite_name: str) -> int:
+    """获取指定 LIBERO 任务套件允许的最大仿真步数。
+
+    不同套件的任务复杂度不同，需要的最大步数也不同：
+        - libero_spatial/object/goal: 400 步
+        - libero_10/90: 700 步（更复杂的任务）
+
+    Args:
+        task_suite_name: LIBERO 任务套件名称。
+
+    Returns:
+        int: 最大仿真步数。
+
+    Raises:
+        ValueError: 未知的任务套件名称。
+    """
     suite_steps = {
         "libero_spatial": 400,
         "libero_object": 400,
@@ -455,7 +777,42 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    cached_context: Optional[torch.Tensor] = None,
+    cached_context_mask: Optional[torch.Tensor] = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
+    """运行单个评估 episode。
+
+    完整的 episode 执行流程:
+        1. 重置环境并设置初始状态。
+        2. 执行 num_steps_wait 步等待（dummy action），让仿真稳定。
+        3. 循环执行 "推理-执行" 重规划策略:
+           - 动作队列为空时: 调用模型推理生成动作块，填充队列
+           - 从队列取出一个动作发送给环境
+           - 可选: 使用 ActionEnsembler 进行动作集成
+           - 可选: 捕获未来帧用于视频预测可视化
+        4. 达到最大步数或任务完成时停止。
+        5. 收集回放图像用于视频保存。
+
+    Args:
+        env: LIBERO 仿真环境。
+        initial_state: 任务的初始状态（用于环境重置）。
+        task_description: 自然语言任务描述。
+        model: FastWAM 模型。
+        processor: 数据处理器。
+        cfg: Hydra 配置。
+        episode_idx: 当前 episode 编号。
+        action_horizon: 动作块长度。
+        input_w: 输入图像宽度。
+        input_h: 输入图像高度。
+        model_device: 模型所在设备。
+
+    Returns:
+        tuple: (success, replay_images, predicted_future_video_clips, episode_mean_psnr)
+            - success: 任务是否成功完成。
+            - replay_images: 回放图像列表，用于保存评估视频。
+            - predicted_future_video_clips: 未来帧预测片段列表（用于可视化）。
+            - episode_mean_psnr: 未来帧预测的平均 PSNR，无预测时返回 None。
+    """
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -498,6 +855,8 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                cached_context=cached_context,
+                cached_context_mask=cached_context_mask,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -595,7 +954,47 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
+    """运行单个 LIBERO 任务的所有 episode。
+
+    依次运行 num_trials 个 episode，收集成功率数据和回放视频。
+    如果启用了未来帧可视化，还会保存预测帧比较视频。
+
+    Args:
+        task: LIBERO 任务对象。
+        initial_states: 任务的初始状态列表。
+        model: FastWAM 模型。
+        processor: 数据处理器。
+        cfg: Hydra 配置。
+        video_dir: 回放视频保存目录。
+        predicted_video_dir: 预测帧比较视频保存目录。
+        action_horizon: 动作块长度。
+        input_w: 输入图像宽度。
+        input_h: 输入图像高度。
+        model_device: 模型所在设备。
+
+    Returns:
+        dict: 包含以下键的评估结果字典:
+            - successes: 成功次数。
+            - failure_episodes: 失败的 episode 编号列表。
+            - success_episodes: 成功的 episode 编号列表。
+            - task_description: 任务描述。
+            - episode_future_video_psnr (可选): 每 episode 的 PSNR 列表。
+            - future_video_psnr_mean (可选): 平均 PSNR。
+    """
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+
+    # 从预计算缓存加载 text embedding（与训练共用同一套缓存，无需加载 T5 到 GPU）
+    cached_context = None
+    cached_context_mask = None
+    text_embedding_cache_dir = cfg.EVALUATION.get("text_embedding_cache_dir", None)
+    if text_embedding_cache_dir:
+        context_len = int(cfg.data.train.get("context_len", 128))
+        prompt = DEFAULT_PROMPT.format(task=task_description)
+        cached_context, cached_context_mask = _load_cached_text_context(
+            prompt, cache_dir=text_embedding_cache_dir, context_len=context_len
+        )
+        logging.info("Loaded cached text context for task: %s", task_description)
+
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
@@ -620,6 +1019,8 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            cached_context=cached_context,
+            cached_context_mask=cached_context_mask,
         )
         if success:
             results["successes"] += 1
@@ -677,6 +1078,28 @@ def run_single_task(
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
 def eval_single_process(cfg: DictConfig):
+    """LIBERO 单任务评估的 Hydra 入口函数。
+
+    执行流程:
+        1. 初始化：设置随机种子、验证配置、解析模型和设备。
+        2. 加载模型：实例化 FastWAM 模型、加载检查点、设置为 eval 模式。
+        3. 初始化处理器：加载数据处理器和数据集统计信息。
+        4. 配置评估参数：action_horizon、图像尺寸、摄像头拼接方式。
+        5. 创建输出目录：videos/ 和 predicted_videos/ 子目录。
+        6. 获取任务：通过 LIBERO benchmark API 获取指定任务和初始状态。
+        7. 执行评估：运行 run_single_task 进行多 episode 评估。
+        8. 保存结果：写入 JSON 结果文件，打印成功率和耗时。
+
+    Args:
+        cfg: Hydra 配置，需包含:
+            - ckpt: 检查点路径 (必需)
+            - EVALUATION.task_suite_name: 套件名 (如 libero_spatial)
+            - EVALUATION.task_id: 任务 ID
+            - EVALUATION.num_trials: 每个任务运行的 episode 数
+            - EVALUATION.output_dir: 输出目录
+            - gpu_id: GPU 编号
+            - 其他推理参数（可选）
+    """
     start_time = time.time()
     partial_state = PartialState()
     partial_state.config = cfg

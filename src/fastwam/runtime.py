@@ -1,3 +1,16 @@
+"""
+FastWAM 运行时模块 —— 模型工厂函数与训练/推理入口。
+
+该模块提供了 FastWAM 系列模型（FastWAM, FastWAMJoint, FastWAMIDM）以及
+原始 Wan22 模型的创建工厂函数，并封装了训练流程（run_training）和推理流程（run_inference）
+的顶层调用逻辑。用户通常通过 Hydra/OmegaConf 配置驱动这些函数。
+
+典型流程：
+    1. 通过配置文件定义模型、数据、训练/推理参数
+    2. 调用 run_training(cfg) 启动训练，或 run_inference(cfg) 执行推理
+    3. 训练流程内部调用 create_fastwam / create_fastwam_joint / create_fastwam_idm 等工厂函数构建模型
+"""
+
 import logging
 import os
 import inspect
@@ -20,6 +33,20 @@ logger = get_logger(__name__)
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
+    """
+    规范化混合精度字符串配置。
+
+    将用户传入的混合精度参数（如 "no", "fp16", "bf16"）统一转为小写并校验合法性。
+
+    参数:
+        mixed_precision (str): 原始混合精度字符串，如 "FP16", "Bf16", "no"
+
+    返回:
+        str: 规范化后的值，只能是 "no" / "fp16" / "bf16"
+
+    异常:
+        ValueError: 如果输入不是字符串或值不在合法范围内
+    """
     if not isinstance(mixed_precision, str):
         raise ValueError(f"`mixed_precision` must be str, got {type(mixed_precision)}")
     key = mixed_precision.strip().lower()
@@ -32,6 +59,18 @@ def _normalize_mixed_precision(mixed_precision: str) -> str:
 
 
 def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
+    """
+    将混合精度配置字符串映射为 PyTorch 数据类型。
+
+    参数:
+        mixed_precision (str): 混合精度类型，如 "no", "fp16", "bf16"
+
+    返回:
+        torch.dtype: 对应的 PyTorch 数据类型
+            - "no"   -> torch.float32
+            - "fp16" -> torch.float16
+            - "bf16" -> torch.bfloat16
+    """
     precision = _normalize_mixed_precision(mixed_precision)
     if precision == "no":
         return torch.float32
@@ -52,6 +91,27 @@ def create_wan22_model(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    """
+    创建原始 Wan22 扩散模型核心（Wan22Core）。
+
+    该函数从 HuggingFace 仓库加载 Wan2.2 预训练权重，并基于传入的 DiT 配置
+    构建核心模型。通常用于纯视频生成的场景，不包含动作/机械臂控制相关模块。
+
+    参数:
+        model_id (str): Wan22 模型在 HuggingFace 上的 ID，如 "Wan-AI/Wan2.2-TI2V-5B"
+        tokenizer_model_id (str): 分词器模型 ID，如 "Wan-AI/Wan2.1-T2V-1.3B"
+        dit_config (dict | DictConfig): DiT 模型配置字典，包含 hidden_dim, num_layers, num_heads 等
+        tokenizer_max_len (int): 分词器最大序列长度，默认 512
+        train_shift (float): 训练时 flow matching 的 shift 参数，默认 5.0
+        infer_shift (float): 推理时 flow matching 的 shift 参数，默认 5.0
+        num_train_timesteps (int): 训练时扩散步数，默认 1000
+        redirect_common_files (bool): 是否重定向通用文件（缓存），默认 True
+        model_dtype (torch.dtype): 模型权重数据类型，默认 torch.bfloat16
+        device (str): 模型所在设备，默认 "cuda"
+
+    返回:
+        Wan22Core: 构建好的 Wan22 模型实例
+    """
     from .models.wan22.wan22 import Wan22Core
 
     if isinstance(dit_config, DictConfig):
@@ -91,6 +151,40 @@ def create_fastwam(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    """
+    创建 FastWAM 模型（标准版）。
+
+    FastWAM 是带有动作调节（action conditioning）的视频扩散模型。它在视频 DiT 的基础上
+    引入了一个额外的动作 DiT（ActionDiT），用于处理机械臂动作序列的扩散建模。
+    视频 DiT 和动作 DiT 通过混合注意力（Mixed Attention, MoT）共享跨模态信息。
+
+    输入输出维度示例:
+        - video_dit_config: {"hidden_dim": 1536, "num_layers": 30, "num_heads": 24, ...}
+        - action_dit_config: {"hidden_dim": 128, "action_dim": 7, "num_layers": 30, ...}
+        - proprio_dim: 机械臂本体感知维度，如 12（关节角 + 夹爪状态等）
+        - 模型内部: 视频特征 [B, T, C, H, W] <-> 动作特征 [B, T', D]
+
+    参数:
+        model_id (str): HuggingFace 模型 ID
+        tokenizer_model_id (str): 分词器模型 ID
+        video_dit_config (dict | DictConfig): 视频 DiT 配置
+        tokenizer_max_len (int): 分词器最大长度，默认 512
+        load_text_encoder (bool): 是否加载文本编码器，默认 True
+        proprio_dim (int | None): 本体感知维度，None 表示不使用
+        action_dit_config (dict | DictConfig | None): 动作 DiT 配置
+        action_dit_pretrained_path (str | None): 动作 DiT 预训练权重路径
+        skip_dit_load_from_pretrain (bool): 是否跳过 DiT 预训练权重加载，默认 False
+        video_scheduler (dict | DictConfig | None): 视频调度器参数
+        action_scheduler (dict | DictConfig | None): 动作调度器参数（必需，需包含 train_shift, infer_shift, num_train_timesteps）
+        loss (dict | DictConfig | None): 损失权重配置，如 {"lambda_video": 1.0, "lambda_action": 1.0}
+        mot_checkpoint_mixed_attn (bool): 是否对混合注意力层使用梯度检查点，默认 True
+        redirect_common_files (bool): 是否重定向通用文件，默认 True
+        model_dtype (torch.dtype): 模型数据类型，默认 torch.bfloat16
+        device (str): 模型所在设备，默认 "cuda"
+
+    返回:
+        FastWAM: 构建好的 FastWAM 模型实例
+    """
     from .models.wan22.fastwam import FastWAM
 
     if isinstance(video_dit_config, DictConfig):
@@ -176,6 +270,18 @@ def create_fastwam_joint(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    """
+    创建 FastWAMJoint 模型（联合版）。
+
+    FastWAMJoint 是 FastWAM 的联合训练变体，在标准 FastWAM 基础上进一步优化了
+    视频 DiT 与动作 DiT 之间的信息融合方式。适用于需要更紧密耦合的视频-动作联合建模场景。
+
+    参数:
+        与 create_fastwam 相同，详见其文档。
+
+    返回:
+        FastWAMJoint: 构建好的 FastWAMJoint 模型实例
+    """
     from .models.wan22.fastwam_joint import FastWAMJoint
 
     if isinstance(video_dit_config, DictConfig):
@@ -261,6 +367,19 @@ def create_fastwam_idm(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
+    """
+    创建 FastWAMIDM 模型（逆动力学模型版）。
+
+    FastWAMIDM 专注于从视频帧序列中推断动作（逆动力学建模），
+    适用于需要从视频观测中提取动作指令的应用场景。
+    与标准 FastWAM 相比，其动作建模模块的设计更偏向于逆推理。
+
+    参数:
+        与 create_fastwam 相同，详见其文档。
+
+    返回:
+        FastWAMIDM: 构建好的 FastWAMIDM 模型实例
+    """
     from .models.wan22.fastwam_idm import (
         FastWAMIDM,
     )
@@ -331,6 +450,20 @@ def create_fastwam_idm(
 
 
 def build_datasets(data_cfg: DictConfig):
+    """
+    从配置构建训练集和验证集数据集。
+
+    如果配置中未提供验证集（data_cfg.val），则复用训练集作为验证集。
+    若验证集有独立的 pretrained_norm_stats，则优先使用；否则回退到训练集或默认路径。
+
+    参数:
+        data_cfg (DictConfig): 数据配置，需包含 train 子配置，可选包含 val 子配置
+            - data_cfg.train: 训练集配置（将被传递给 hydra.utils.instantiate）
+            - data_cfg.val: 验证集配置（可选）
+
+    返回:
+        tuple: (train_dataset, val_dataset) 两个数据集实例
+    """
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
         val_ds = train_ds
@@ -345,6 +478,15 @@ def build_datasets(data_cfg: DictConfig):
 
 
 def _resolve_train_device() -> str:
+    """
+    解析训练设备，支持分布式训练环境。
+
+    根据 CUDA 可用性和环境变量 LOCAL_RANK 自动选择设备。
+    分布式训练时，每个进程使用对应的 cuda:N 设备。
+
+    返回:
+        str: 设备标识，如 "cpu", "cuda:0", "cuda:1"
+    """
     if not torch.cuda.is_available():
         return "cpu"
     device_count = torch.cuda.device_count()
@@ -357,6 +499,23 @@ def _resolve_train_device() -> str:
 
 
 def run_training(cfg: DictConfig):
+    """
+    运行完整的训练流程。
+
+    这是训练入口函数，执行以下步骤：
+        1. 初始化日志和输出目录，保存配置快照
+        2. 根据配置创建模型（通过 Hydra instantiate）
+        3. 构建训练集和验证集
+        4. 创建 Wan22Trainer 训练器并启动训练循环
+
+    参数:
+        cfg (DictConfig): 完整的 Hydra/OmegaConf 配置对象，需包含:
+            - cfg.output_dir: 输出目录
+            - cfg.mixed_precision: 混合精度设置
+            - cfg.model: 模型配置
+            - cfg.data: 数据集配置
+            - cfg.learning_rate, cfg.batch_size, cfg.num_epochs 等训练超参数
+    """
     setup_logging(
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
@@ -381,6 +540,34 @@ def run_training(cfg: DictConfig):
     trainer.train()
 
 def run_inference(cfg: DictConfig):
+    """
+    运行推理流程，从输入图像生成视频。
+
+    执行以下步骤：
+        1. 加载模型和可选的微调检查点
+        2. 读取输入图像，进行中心裁剪并缩放到目标尺寸
+        3. 将图像归一化到 [-1, 1] 范围并增加 batch 维度
+        4. 调用模型进行推理生成视频
+        5. 保存生成的视频为 MP4 文件
+
+    参数:
+        cfg (DictConfig): 完整的 Hydra 配置，需包含 cfg.inference 子配置:
+            - cfg.inference.device: 推理设备
+            - cfg.inference.checkpoint_path: 检查点路径（可选）
+            - cfg.inference.input_image_path: 输入图像路径
+            - cfg.inference.width, cfg.inference.height: 目标尺寸
+            - cfg.inference.prompt: 文本提示
+            - cfg.inference.negative_prompt: 负面提示
+            - cfg.inference.text_cfg_scale: 文本 CFG 缩放系数
+            - cfg.inference.action_cfg_scale: 动作 CFG 缩放系数
+            - cfg.inference.num_frames: 生成视频帧数
+            - cfg.inference.num_inference_steps: 推理步数
+            - cfg.inference.seed: 随机种子
+            - cfg.inference.output_mp4: 输出视频路径
+
+    返回:
+        str: 输出视频文件的路径
+    """
     setup_logging(log_level=logging.INFO)
     inference_cfg = cfg.inference
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
@@ -396,8 +583,22 @@ def run_inference(cfg: DictConfig):
         else:
             logger.warning("Checkpoint not found, skipping load: %s", checkpoint_path)
     model.eval()
-    
+
     def center_crop_resize(img: Image, width: int, height: int) -> Image.Image:
+        """
+        对输入图像执行中心裁剪并缩放到目标尺寸。
+
+        先按最长边等比放大，使得目标尺寸完全包含在图像内，
+        然后从中心区域裁剪出精确的目标尺寸。
+
+        参数:
+            img (Image): 输入 PIL Image
+            width (int): 目标宽度
+            height (int): 目标高度
+
+        返回:
+            Image.Image: 裁剪缩放后的图像
+        """
         src_w, src_h = img.size
         scale = max(width / src_w, height / src_h)
         resized = img.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
