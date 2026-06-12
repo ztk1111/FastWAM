@@ -1,6 +1,7 @@
 from typing import Any, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from fastwam.utils.logging_config import get_logger
@@ -43,6 +44,96 @@ class FastWAMIDM(FastWAMJoint):
     # Hardcoded probability: during training, cond-video is noised with this chance.
     # 训练时条件视频被加噪的概率。用于增强对噪声视频条件的鲁棒性
     video_cond_noise_prob = 0.5
+
+    def __init__(self, *args, bidirectional_config: Optional[dict] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bidirectional_config = dict(bidirectional_config or {})
+        self.bidirectional_enabled = bool(self.bidirectional_config.get("enabled", False))
+        self.bidirectional_direction_token = self.bidirectional_enabled and bool(
+            self.bidirectional_config.get("direction_token", True)
+        )
+        if self.bidirectional_direction_token:
+            self.direction_embedding = nn.Embedding(2, self.text_dim).to(device=self.device, dtype=self.torch_dtype)
+        else:
+            self.direction_embedding = None
+
+    def _direction_id(self, direction: str) -> int:
+        if direction == "forward":
+            return 0
+        if direction == "backward":
+            return 1
+        raise ValueError(f"Unknown IDM direction: {direction}")
+
+    def _append_direction_to_context(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        direction: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.direction_embedding is None:
+            return context, context_mask
+        direction_ids = torch.full(
+            (context.shape[0],),
+            self._direction_id(direction),
+            device=context.device,
+            dtype=torch.long,
+        )
+        direction_emb = self.direction_embedding(direction_ids).to(dtype=context.dtype).unsqueeze(1)
+        direction_mask = torch.ones((context.shape[0], 1), device=context_mask.device, dtype=torch.bool)
+        return torch.cat([direction_emb, context], dim=1), torch.cat([direction_mask, context_mask], dim=1)
+
+    def _bidirectional_delta_action_mask(self, device: torch.device, action_dim: int) -> Optional[torch.Tensor]:
+        mask = self.bidirectional_config.get("delta_action_dim_mask")
+        if mask is None:
+            return None
+        if isinstance(mask, dict):
+            mask = mask.get("default")
+        mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=device)
+        if mask_tensor.numel() != action_dim:
+            raise ValueError(
+                f"bidirectional.delta_action_dim_mask length must be {action_dim}, got {mask_tensor.numel()}"
+            )
+        return mask_tensor
+
+    def _reverse_action(self, action: torch.Tensor) -> torch.Tensor:
+        action_rev = action.flip(dims=[1]).clone()
+        delta_mask = self._bidirectional_delta_action_mask(action_rev.device, action_rev.shape[-1])
+        if delta_mask is not None:
+            action_rev[..., delta_mask] = -action_rev[..., delta_mask]
+        return action_rev
+
+    def _make_backward_sample(self, sample: dict) -> dict:
+        sample_bwd = dict(sample)
+        sample_bwd["video"] = sample["video"].flip(dims=[2])
+        if sample.get("image_is_pad") is not None:
+            sample_bwd["image_is_pad"] = sample["image_is_pad"].flip(dims=[1])
+        sample_bwd["action"] = self._reverse_action(sample["action"])
+        if sample.get("action_is_pad") is not None:
+            sample_bwd["action_is_pad"] = sample["action_is_pad"].flip(dims=[1])
+        if sample.get("proprio") is not None:
+            sample_bwd["proprio"] = sample["proprio"].flip(dims=[1])
+        if sample.get("proprio_is_pad") is not None:
+            sample_bwd["proprio_is_pad"] = sample["proprio_is_pad"].flip(dims=[1])
+        return sample_bwd
+
+    @staticmethod
+    def _merge_bidirectional_loss_dict(dict_fwd: dict, dict_bwd: dict, lambda_backward: float) -> dict:
+        loss_dict = {}
+        for key, value in dict_fwd.items():
+            loss_dict[f"{key}_forward"] = value
+        for key, value in dict_bwd.items():
+            loss_dict[f"{key}_backward"] = value
+        if "loss_video" in dict_fwd and "loss_video" in dict_bwd:
+            loss_dict["loss_video"] = 0.5 * (dict_fwd["loss_video"] + dict_bwd["loss_video"])
+        if "loss_action" in dict_fwd and "loss_action" in dict_bwd:
+            loss_dict["loss_action"] = 0.5 * (dict_fwd["loss_action"] + dict_bwd["loss_action"])
+        loss_dict["loss_bidirectional_total"] = dict_fwd.get("loss_total", 0.0) + lambda_backward * dict_bwd.get("loss_total", 0.0)
+        return loss_dict
+
+    def _encode_goal_tokens(self, context: torch.Tensor, context_mask: torch.Tensor) -> Optional[torch.Tensor]:
+        # Goal-token conditioning is intentionally disabled for the bidirectional IDM version.
+        # Keep this stub so old checkpoints/configs remain loadable while the training path is text-only.
+        return None
 
     @torch.no_grad()
     def _build_teacher_forcing_attention_mask(
@@ -106,34 +197,33 @@ class FastWAMIDM(FastWAMJoint):
         return mask
 
     def training_loss(self, sample, tiled: bool = False):
-        """FastWAMIDM 的训练损失计算。
+        """FastWAMIDM training loss with optional paired backward dynamics training."""
+        if not self.bidirectional_enabled:
+            return self._training_loss_single_direction(sample, direction="forward", tiled=tiled)
 
-        与父类的关键区别：
-          1. 三个分支并行处理：
-             - 分支 A（噪声视频）：视频扩散目标的标准加噪视频
-             - 分支 B（加噪动作）：动作扩散目标的标准加噪动作
-             - 分支 C（条件视频）：teacher-forcing 条件视频（每样本独立概率加噪）
-          2. 视频专家输入 = [分支A tokens | 分支C tokens] 拼接
-          3. 使用 _build_teacher_forcing_attention_mask 代替标准掩码
-          4. 联合损失 = 视频损失（仅分支A）+ 动作损失（分支B）
+        sample_bwd = self._make_backward_sample(sample)
+        loss_fwd, dict_fwd = self._training_loss_single_direction(sample, direction="forward", tiled=tiled)
+        loss_bwd, dict_bwd = self._training_loss_single_direction(sample_bwd, direction="backward", tiled=tiled)
+        lambda_backward = float(self.bidirectional_config.get("lambda_backward", 1.0))
+        loss_total = loss_fwd + lambda_backward * loss_bwd
+        loss_dict = self._merge_bidirectional_loss_dict(dict_fwd, dict_bwd, lambda_backward)
+        return loss_total, loss_dict
 
-        输入: sample (dict) — 包含 video, context, context_mask, action 等
-              tiled (bool): VAE 分块处理
-
-        输出: (loss_total, loss_dict)
-        """
+    def _training_loss_single_direction(self, sample, direction: str, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        context, context_mask = self._append_direction_to_context(context, context_mask, direction)
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
         fuse_flag = inputs["fuse_vae_embedding_in_latents"]
 
-        # Branch A: noisy video (for video denoising target).
-        # 分支 A：噪声视频（用于视频去噪目标）
+        first_frame_latents = inputs["first_frame_latents"]
+
+        # Branch A: noisy video latents.
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -142,11 +232,10 @@ class FastWAMIDM(FastWAMJoint):
         )
         latents_noisy = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-        if inputs["first_frame_latents"] is not None:
-            latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
+        if first_frame_latents is not None:
+            latents_noisy[:, :, 0:1] = first_frame_latents
 
         # Branch B: noisy action.
-        # 分支 B：加噪动作
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -156,10 +245,7 @@ class FastWAMIDM(FastWAMJoint):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        # Branch C: teacher-forcing cond-video.
-        # 分支 C：Teacher-Forcing 条件视频
-        # Each sample is independently noised with probability `video_cond_noise_prob`.
-        # 每个样本独立地以 probability=video_cond_noise_prob 的概率被加噪
+        # Branch C: teacher-forcing condition uses GT video latents.
         cond_noise_mask = torch.rand((batch_size,), device=self.device) < float(self.video_cond_noise_prob)
         timestep_video_cond = torch.zeros_like(timestep_video, dtype=input_latents.dtype, device=self.device)
         latents_cond = input_latents
@@ -176,12 +262,10 @@ class FastWAMIDM(FastWAMJoint):
             )
             cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
             latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
-        # 首帧始终保持一致（无论是否加噪）
-        if inputs["first_frame_latents"] is not None:
+        if first_frame_latents is not None:
             latents_cond = latents_cond.clone()
-            latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
+            latents_cond[:, :, 0:1] = first_frame_latents
 
-        # ---- pre_dit 编码 ----
         video_pre_noisy = self.video_expert.pre_dit(
             x=latents_noisy,
             timestep=timestep_video,
@@ -189,6 +273,7 @@ class FastWAMIDM(FastWAMJoint):
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            extra_context_emb=None,
         )
         video_pre_cond = self.video_expert.pre_dit(
             x=latents_cond,
@@ -197,6 +282,7 @@ class FastWAMIDM(FastWAMJoint):
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            extra_context_emb=None,
         )
         if video_pre_noisy["t_mod"].ndim != 4 or video_pre_cond["t_mod"].ndim != 4:
             raise ValueError(
@@ -215,15 +301,14 @@ class FastWAMIDM(FastWAMJoint):
         cond_video_seq_len = int(video_pre_cond["tokens"].shape[1])
         noisy_video_tokens_per_frame = int(video_pre_noisy["meta"]["tokens_per_frame"])
         cond_video_tokens_per_frame = int(video_pre_cond["meta"]["tokens_per_frame"])
-
-        # Concatenate [noisy_video, cond_video] as the video expert sequence.
-        # 将 [噪声视频 | 条件视频] 拼接作为视频专家的完整 token 序列
+        #满足npu算子
+        video_pre_noisy["freqs"] = video_pre_noisy["freqs"].to(torch.complex64)
+        video_pre_cond["freqs"] = video_pre_cond["freqs"].to(torch.complex64)
         merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
         merged_video_freqs = torch.cat([video_pre_noisy["freqs"], video_pre_cond["freqs"]], dim=0)
         merged_video_t_mod = torch.cat([video_pre_noisy["t_mod"], video_pre_cond["t_mod"]], dim=1)
         merged_video_context_mask = torch.cat([video_pre_noisy["context_mask"], video_pre_cond["context_mask"]], dim=1)
 
-        # 使用 Teacher-Forcing 注意力掩码：动作仅关注条件视频
         attention_mask = self._build_teacher_forcing_attention_mask(
             noisy_video_seq_len=noisy_video_seq_len,
             cond_video_seq_len=cond_video_seq_len,
@@ -233,7 +318,6 @@ class FastWAMIDM(FastWAMJoint):
             device=merged_video_tokens.device,
         )
 
-        # ---- MoT 混合注意力 ----
         tokens_out = self.mot(
             embeds_all={
                 "video": merged_video_tokens,
@@ -260,15 +344,12 @@ class FastWAMIDM(FastWAMJoint):
             },
         )
 
-        # Only the noisy-video half contributes to video denoising loss.
-        # 仅噪声视频部分参与视频去噪损失（条件视频不产生视频损失）
         pred_video_tokens = tokens_out["video"][:, :noisy_video_seq_len]
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        # ---- 损失计算 ----
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
+        include_initial_video_step = first_frame_latents is None
+        if first_frame_latents is not None:
             pred_video = pred_video[:, :, 1:]
             target_video = target_video[:, :, 1:]
 
@@ -300,6 +381,7 @@ class FastWAMIDM(FastWAMJoint):
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_total": float(loss_total.detach().item()),
         }
         return loss_total, loss_dict
 
@@ -430,7 +512,7 @@ class FastWAMIDM(FastWAMJoint):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        # 计算隐空间维度
+        # 计算完整视频隐空间维度。IDM 推理只使用正向完整 latent chunk。
         latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
@@ -451,7 +533,7 @@ class FastWAMIDM(FastWAMJoint):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        # 编码首帧并替代噪声首帧
+        # 编码首帧并固定为视频 latent anchor。
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
@@ -480,6 +562,8 @@ class FastWAMIDM(FastWAMJoint):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        context, context_mask = self._append_direction_to_context(context, context_mask, "forward")
+        video_goal_hidden = None
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
@@ -504,6 +588,7 @@ class FastWAMIDM(FastWAMJoint):
                 context_mask=context_mask,
                 action=None,
                 fuse_vae_embedding_in_latents=fuse_flag,
+                extra_context_emb=None,
             )
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
@@ -520,6 +605,7 @@ class FastWAMIDM(FastWAMJoint):
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            extra_context_emb=None,
         )
         video_seq_len = int(video_pre_cond["tokens"].shape[1])
         # 构建动作可关注完整视频的注意力掩码

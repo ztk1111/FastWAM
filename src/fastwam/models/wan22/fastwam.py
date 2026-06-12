@@ -71,6 +71,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        goal_token_config: Optional[dict] = None,
+        subgoal_latent_config: Optional[dict] = None,
+        bidirectional_config: Optional[dict] = None,
     ):
         """初始化 FastWAM 模型。
 
@@ -141,8 +144,69 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.subgoal_latent_config = dict(subgoal_latent_config or {})
+        self.subgoal_latent_enabled = bool(self.subgoal_latent_config.get("enabled", False))
+
+        # Goal token bank (optional, for IDM Stage 1 video/subgoal latent generation)
+        self.goal_token_encoder: Optional[nn.Module] = None
+        self.video_goal_adapter: Optional[nn.Linear] = None
+        self.train_video_goal_adapter = False
+        if goal_token_config is not None and bool(goal_token_config.get("enabled", True)):
+            self._init_goal_token(goal_token_config)
 
         self.to(self.device)
+
+    def _init_goal_token(self, goal_token_config: dict):
+        """Initialise goal token encoder and video-goal adapter from config.
+
+        Loads weights from an alignment checkpoint and validates config consistency.
+        The encoder is frozen by default; the adapter trainability follows the config.
+        """
+        from .goal_token_bank import GoalTokenBank
+
+        cfg = dict(goal_token_config)
+        checkpoint_path = cfg["checkpoint_path"]
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ckpt_cfg = ckpt.get("config", {})
+        # Validate critical dims match between user config and checkpoint
+        for key in ("goal_dim", "num_goal_tokens", "num_heads"):
+            if int(cfg.get(key, 0)) != int(ckpt_cfg.get(key, 0)):
+                raise ValueError(
+                    f"goal_token config mismatch for '{key}': "
+                    f"config={cfg.get(key)}, checkpoint={ckpt_cfg.get(key)}"
+                )
+        goal_dim = int(cfg["goal_dim"])
+        num_heads = int(cfg["num_heads"])
+        num_goal_tokens = int(cfg["num_goal_tokens"])
+        hidden_dim = int(ckpt_cfg.get("hidden_dim", cfg.get("hidden_dim", 2048)))
+
+        self.goal_token_encoder = GoalTokenBank(
+            text_dim=4096,
+            goal_dim=goal_dim,
+            num_goal_tokens=num_goal_tokens,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=float(ckpt_cfg.get("dropout", 0.0)),
+        ).to(device=self.device, dtype=self.torch_dtype)
+        # Load alignment weights (strict=False — goal_token_bank has extra image-path params)
+        missing, unexpected = self.goal_token_encoder.load_state_dict(ckpt["model"], strict=False)
+        if missing:
+            logger.warning("GoalTokenBank missing keys: %s", missing)
+        if unexpected:
+            logger.warning("GoalTokenBank unexpected keys: %s", unexpected)
+
+        if cfg.get("freeze_encoder", True):
+            for p in self.goal_token_encoder.parameters():
+                p.requires_grad = False
+            self.goal_token_encoder.eval()
+
+        self.video_goal_adapter = nn.Linear(goal_dim, self.video_expert.hidden_dim).to(
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+        train_adapter = bool(cfg.get("train_video_adapter", True))
+        self.train_video_goal_adapter = train_adapter
+        self.video_goal_adapter.requires_grad_(train_adapter)
 
     @classmethod
     def from_wan22_pretrained(
@@ -168,6 +232,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        goal_token_config: Optional[dict] = None,
+        subgoal_latent_config: Optional[dict] = None,
+        bidirectional_config: Optional[dict] = None,
     ):
         """从预训练的 Wan2.2-TI2V-5B 检查点加载并构建 FastWAM 模型。
 
@@ -237,6 +304,10 @@ class FastWAM(torch.nn.Module):
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
 
+        model_kwargs = {}
+        if bidirectional_config is not None:
+            model_kwargs["bidirectional_config"] = bidirectional_config
+
         model = cls(
             video_expert=video_expert,
             action_expert=action_expert,
@@ -256,6 +327,9 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            goal_token_config=goal_token_config,
+            subgoal_latent_config=subgoal_latent_config,
+            **model_kwargs,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -369,6 +443,12 @@ class FastWAM(torch.nn.Module):
             torch.cat([context_mask, proprio_mask], dim=1),
         )
 
+    def _ensure_vae_device(self):
+        # Some distributed wrappers only move trainable modules; keep frozen VAE aligned explicitly.
+        vae_param = next(self.vae.parameters(), None)
+        if vae_param is not None and vae_param.device != self.device:
+            self.vae.to(device=self.device, dtype=self.torch_dtype)
+
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         """将视频像素张量编码为 VAE 隐空间表示。
@@ -379,6 +459,7 @@ class FastWAM(torch.nn.Module):
               - T_lat = (T - 1) // temporal_downsample_factor + 1
               - H_lat = H // upsampling_factor, W_lat = W // upsampling_factor
         """
+        self._ensure_vae_device()
         z = self.vae.encode(
             video_tensor,
             device=self.device,
@@ -403,6 +484,7 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
+        self._ensure_vae_device()
         image = input_image.to(device=self.device)[0].unsqueeze(1)
         z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
@@ -1510,6 +1592,13 @@ class FastWAM(torch.nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.goal_token_encoder is not None:
+            payload["goal_token_encoder"] = self.goal_token_encoder.state_dict()
+        if self.video_goal_adapter is not None:
+            payload["video_goal_adapter"] = self.video_goal_adapter.state_dict()
+        direction_embedding = getattr(self, "direction_embedding", None)
+        if direction_embedding is not None:
+            payload["direction_embedding"] = direction_embedding.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1542,6 +1631,24 @@ class FastWAM(torch.nn.Module):
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        if self.goal_token_encoder is not None:
+            if "goal_token_encoder" in payload:
+                self.goal_token_encoder.load_state_dict(payload["goal_token_encoder"], strict=False)
+            else:
+                logger.warning("Checkpoint has no `goal_token_encoder` weights; keeping current encoder params.")
+        if self.video_goal_adapter is not None:
+            if "video_goal_adapter" in payload:
+                self.video_goal_adapter.load_state_dict(payload["video_goal_adapter"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `video_goal_adapter` weights; keeping current adapter params.")
+
+        direction_embedding = getattr(self, "direction_embedding", None)
+        if direction_embedding is not None:
+            if "direction_embedding" in payload:
+                direction_embedding.load_state_dict(payload["direction_embedding"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `direction_embedding` weights; keeping current direction params.")
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

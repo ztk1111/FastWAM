@@ -366,6 +366,10 @@ def create_fastwam_idm(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    goal_token: dict | None = None,
+    goal_token_config: dict | None = None,
+    bidirectional: dict | None = None,
+    bidirectional_config: dict | None = None,
 ):
     """
     创建 FastWAMIDM 模型（逆动力学模型版）。
@@ -424,6 +428,18 @@ def create_fastwam_idm(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    # Goal-token conditioning is intentionally disabled for this IDM training variant.
+    goal_token_config = None
+
+    if isinstance(bidirectional, DictConfig):
+        bidirectional = OmegaConf.to_container(bidirectional, resolve=True)
+    if isinstance(bidirectional_config, DictConfig):
+        bidirectional_config = OmegaConf.to_container(bidirectional_config, resolve=True)
+    if bidirectional_config is None:
+        bidirectional_config = bidirectional
+    if bidirectional_config is not None and not isinstance(bidirectional_config, dict):
+        raise ValueError(f"bidirectional must be dict-like, got {type(bidirectional_config)}")
+
     return FastWAMIDM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -446,6 +462,9 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        goal_token_config=goal_token_config,
+        subgoal_latent_config=None,
+        bidirectional_config=bidirectional_config,
     )
 
 
@@ -478,24 +497,27 @@ def build_datasets(data_cfg: DictConfig):
 
 
 def _resolve_train_device() -> str:
-    """
-    解析训练设备，支持分布式训练环境。
-
-    根据 CUDA 可用性和环境变量 LOCAL_RANK 自动选择设备。
-    分布式训练时，每个进程使用对应的 cuda:N 设备。
-
-    返回:
-        str: 设备标识，如 "cpu", "cuda:0", "cuda:1"
-    """
-    if not torch.cuda.is_available():
-        return "cpu"
-    device_count = torch.cuda.device_count()
-    if device_count <= 1:
-        return "cuda:0"
+    """解析训练设备，支持 CUDA/NPU 分布式训练环境。"""
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if local_rank < 0 or local_rank >= device_count:
-        return "cuda:0"
-    return f"cuda:{local_rank}"
+
+    npu = getattr(torch, "npu", None)
+    if npu is not None and npu.is_available():
+        device_count = npu.device_count()
+        if device_count <= 1:
+            return "npu:0"
+        if local_rank < 0 or local_rank >= device_count:
+            return "npu:0"
+        return f"npu:{local_rank}"
+
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return "cuda:0"
+        if local_rank < 0 or local_rank >= device_count:
+            return "cuda:0"
+        return f"cuda:{local_rank}"
+
+    return "cpu"
 
 
 def run_training(cfg: DictConfig):

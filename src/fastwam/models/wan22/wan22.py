@@ -595,6 +595,19 @@ class Wan22Core(torch.nn.Module):
 
         return {"video": self._decode_latents(latents, tiled=tiled)}
 
+    @staticmethod
+    def _state_to_cpu(obj):
+        """Move tensors in a nested checkpoint payload to CPU without changing dtype."""
+        if torch.is_tensor(obj):
+            return obj.detach().cpu()
+        if isinstance(obj, dict):
+            return {key: Wan22Core._state_to_cpu(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [Wan22Core._state_to_cpu(value) for value in obj]
+        if isinstance(obj, tuple):
+            return tuple(Wan22Core._state_to_cpu(value) for value in obj)
+        return obj
+
     def save_checkpoint(self, path, optimizer=None, step=None):
         """保存模型检查点到磁盘。
 
@@ -604,12 +617,12 @@ class Wan22Core(torch.nn.Module):
             step (int): 当前训练步数（可选）
         """
         payload = {
-            "dit": self.dit.state_dict(),
+            "dit": self._state_to_cpu(self.dit.state_dict()),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
         }
         if optimizer is not None:
-            payload["optimizer"] = optimizer.state_dict()
+            payload["optimizer"] = self._state_to_cpu(optimizer.state_dict())
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):

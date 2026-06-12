@@ -9,6 +9,18 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
+# Goal-token conditioning is intentionally disabled in the current IDM-only bidirectional version.
+goal_token:
+  enabled: false
+
+bidirectional:
+  enabled: false
+  paired_same_sample: true
+  lambda_backward: 1.0
+  direction_token: true
+  reverse_action_mode: delta_aware
+  delta_action_dim_mask: null
+
 video_dit_config:
   has_image_input: false
   patch_size: [1, 2, 2]

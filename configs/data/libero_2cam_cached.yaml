@@ -1,0 +1,7 @@
+train:
+  _target_: fastwam.datasets.cache.cached_robot_video_dataset.CachedRobotVideoDataset
+  cache_dir: ./data/cache/libero_idm_2cam224/train
+  video_dtype: float32
+  context_dtype: null
+  action_dtype: null
+

@@ -140,12 +140,18 @@ class Wan22Trainer:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
         # 在优化器/DeepSpeed 初始化前冻结非训练模块。
-        # 这确保 ZeRO 构建优化器状态时只包含 DiT（+ 可选的本体感知编码器）的可训练参数。
+        # 这确保 ZeRO 构建优化器状态时只包含 DiT、可选本体感知编码器和 goal adapter 的可训练参数。
         self._apply_dit_only_train_mode(self.model)
         trainable_params = list(self.model.dit.parameters())
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
+        video_goal_adapter = getattr(self.model, "video_goal_adapter", None)
+        if video_goal_adapter is not None and any(p.requires_grad for p in video_goal_adapter.parameters()):
+            trainable_params.extend(list(video_goal_adapter.parameters()))
+        direction_embedding = getattr(self.model, "direction_embedding", None)
+        if direction_embedding is not None and any(p.requires_grad for p in direction_embedding.parameters()):
+            trainable_params.extend(list(direction_embedding.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -441,10 +447,10 @@ class Wan22Trainer:
     @staticmethod
     def _apply_dit_only_train_mode(model):
         """
-        将模型设置为仅 DiT（+ 可选的本体感知编码器）训练模式。
+        将模型设置为仅 DiT（+ 可选的本体感知编码器 / goal adapter）训练模式。
 
-        将所有模块设为 eval 并冻结梯度，然后仅对 model.dit 和
-        model.proprio_encoder（如果存在）启用训练模式和梯度计算。
+        将所有模块设为 eval 并冻结梯度，然后仅对 model.dit、
+        model.proprio_encoder（如果存在）和可训练 goal adapter 启用训练模式和梯度计算。
         视频 VAE、文本编码器和其他辅助模块保持冻结。
 
         参数:
@@ -458,6 +464,14 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        video_goal_adapter = getattr(model, "video_goal_adapter", None)
+        if video_goal_adapter is not None and bool(getattr(model, "train_video_goal_adapter", False)):
+            video_goal_adapter.train()
+            video_goal_adapter.requires_grad_(True)
+        direction_embedding = getattr(model, "direction_embedding", None)
+        if direction_embedding is not None:
+            direction_embedding.train()
+            direction_embedding.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -863,7 +877,11 @@ class Wan22Trainer:
         参数:
             state_dir (str): 状态目录路径，包含加速器子文件夹和可选的 trainer_state.json
         """
-        self.accelerator.load_state(input_dir=state_dir)
+        # torch_npu can rebuild checkpoint tensors with requires_grad=True and
+        # then call Tensor.set_ during torch.load, which autograd rejects unless
+        # checkpoint loading is explicitly outside grad tracking.
+        with torch.no_grad():
+            self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:

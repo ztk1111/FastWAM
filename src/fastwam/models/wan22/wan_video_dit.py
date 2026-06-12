@@ -976,6 +976,7 @@ class WanVideoDiT(torch.nn.Module):
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
         control_camera_latents_input: Optional[torch.Tensor] = None,
+        extra_context_emb: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         DiT 前处理：将输入视频、文本条件、时间步等转换为 token 序列。
@@ -1054,6 +1055,11 @@ class WanVideoDiT(torch.nn.Module):
 
         # 文本编码投影
         context = self.text_embedding(context)  # (B, L, dim)
+        # Append goal token embeddings as globally-visible extra context (for IDM Stage 1)
+        if extra_context_emb is not None:
+            context = torch.cat([context, extra_context_emb], dim=1)  # (B, L+M, dim)
+            goal_mask = torch.ones((batch_size, extra_context_emb.shape[1]), dtype=torch.bool, device=context.device)
+            context_mask = torch.cat([context_mask, goal_mask], dim=1)  # (B, L+M)
         context_len = context.shape[1]
         # 如果启用动作条件且提供了动作，拼接动作嵌入到条件序列中
         if self.action_conditioned and action is not None:
@@ -1152,6 +1158,7 @@ class WanVideoDiT(torch.nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
+        extra_context_emb: Optional[torch.Tensor] = None,
     ):
         """
         完整的前向传播流程：预处理 -> 逐层 DiTBlock -> 后处理。
@@ -1174,6 +1181,7 @@ class WanVideoDiT(torch.nn.Module):
             context_mask=context_mask,
             action=action,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            extra_context_emb=extra_context_emb,
         )
         x_tokens = pre_state["tokens"]
         context_emb = pre_state["context"]
