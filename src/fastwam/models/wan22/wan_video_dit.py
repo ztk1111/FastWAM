@@ -1150,6 +1150,45 @@ class WanVideoDiT(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
+    def forward_backbone(self, pre_state: Dict[str, Any]) -> torch.Tensor:
+        """执行 pre_dit 之后的 DiT block 主干，返回输出 token。"""
+        x_tokens = pre_state["tokens"]
+        context_emb = pre_state["context"]
+        t_mod = pre_state["t_mod"]
+        freqs = pre_state["freqs"]
+        context_attn_mask = pre_state["context_mask"]
+        # 构建视频自注意力掩码（双向模式不需要掩码，可加速计算）
+        self_attn_mask = self.build_video_to_video_mask(
+            video_seq_len=x_tokens.shape[1],
+            video_tokens_per_frame=int(pre_state["meta"]["tokens_per_frame"]),
+            device=x_tokens.device,
+        ) if self.video_attention_mask_mode != "bidirectional" else None
+
+        # 逐层通过所有 DiTBlock
+        for block in self.blocks:
+            if self.use_gradient_checkpointing:
+                # 使用梯度检查点节省显存（以额外计算换显存）
+                x_tokens = gradient_checkpoint_forward(
+                    block,
+                    self.use_gradient_checkpointing,
+                    x_tokens,
+                    context_emb,
+                    t_mod,
+                    freqs,
+                    context_mask=context_attn_mask,
+                    self_attn_mask=self_attn_mask,
+                )
+            else:
+                x_tokens = block(
+                    x_tokens,
+                    context_emb,
+                    t_mod,
+                    freqs,
+                    context_mask=context_attn_mask,
+                    self_attn_mask=self_attn_mask,
+                )
+        return x_tokens
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1183,28 +1222,5 @@ class WanVideoDiT(torch.nn.Module):
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
             extra_context_emb=extra_context_emb,
         )
-        x_tokens = pre_state["tokens"]
-        context_emb = pre_state["context"]
-        t_mod = pre_state["t_mod"]
-        freqs = pre_state["freqs"]
-        context_attn_mask = pre_state["context_mask"]
-        # 构建视频自注意力掩码（双向模式不需要掩码，可加速计算）
-        self_attn_mask = self.build_video_to_video_mask(
-            video_seq_len=x_tokens.shape[1],
-            video_tokens_per_frame=int(pre_state["meta"]["tokens_per_frame"]),
-            device=x_tokens.device,
-        ) if self.video_attention_mask_mode != "bidirectional" else None  # special rule for faster speed
-
-        # 逐层通过所有 DiTBlock
-        for block in self.blocks:
-            if self.use_gradient_checkpointing:
-                # 使用梯度检查点节省显存（以额外计算换显存）
-                x_tokens = gradient_checkpoint_forward(
-                    block,
-                    self.use_gradient_checkpointing,
-                    x_tokens, context_emb, t_mod, freqs, context_mask=context_attn_mask, self_attn_mask=self_attn_mask
-                )
-            else:
-                x_tokens = block(x_tokens, context_emb, t_mod, freqs, context_mask=context_attn_mask, self_attn_mask=self_attn_mask)
-
+        x_tokens = self.forward_backbone(pre_state)
         return self.post_dit(x_tokens, pre_state)

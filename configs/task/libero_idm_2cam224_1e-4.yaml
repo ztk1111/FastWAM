@@ -8,7 +8,7 @@ defaults:
 # dataloading
 batch_size: 4
 num_workers: 0
-
+persistent_workers: false
 model:
   mot_checkpoint_mixed_attn: false
 
@@ -19,7 +19,7 @@ num_epochs: 10
 max_steps: null
 log_every: 10
 save_every: 6000
-eval_every: 0
+eval_every: 200
 
 # training
 gradient_accumulation_steps: 1

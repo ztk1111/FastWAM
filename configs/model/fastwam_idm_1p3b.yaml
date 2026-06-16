@@ -1,0 +1,74 @@
+_target_: fastwam.runtime.create_fastwam_idm
+model_id: Wan-AI/Wan2.1-T2V-1.3B
+video_backbone_type: wan2_1_t2v
+video_backbone_name: Wan-AI/Wan2.1-T2V-1.3B
+video_latent_spatial_downsample_factor: 2
+apply_video_latent_downsample_to_action_branch: false
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: 8
+redirect_common_files: false
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: null
+skip_dit_load_from_pretrain: false
+
+# Goal-token conditioning is intentionally disabled in the current IDM-only bidirectional version.
+goal_token:
+  enabled: false
+
+bidirectional:
+  enabled: false
+  paired_same_sample: true
+  lambda_backward: 1.0
+  direction_token: true
+  reverse_action_mode: delta_aware
+  delta_action_dim_mask: null
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 16
+  hidden_dim: 1536
+  ffn_dim: 8960
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 16
+  num_heads: 12
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: 7
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: 7
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 12
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_action: 1.0

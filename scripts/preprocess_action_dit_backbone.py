@@ -19,7 +19,8 @@ ActionDiT 骨干网络预处理脚本 —— 从 WanVideoDiT 权重插值生成 
     但部分张量的最后一维（如 hidden_dim）可能不同（视频 DiT 为 1536，动作 DiT 通常更小）。
     该脚本通过顺序的 1D 线性插值适配这些维度差异。
 """
-
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import argparse
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from fastwam.models.wan22.action_dit import ActionDiT
-from fastwam.models.wan22.helpers.loader import load_wan22_ti2v_5b_components
+from fastwam.models.wan22.helpers.loader import load_wan_video_components
 
 
 def _parse_dtype(name: str) -> torch.dtype:
@@ -307,7 +308,7 @@ def main() -> None:
     处理流程：
         1. 解析命令行参数
         2. 加载模型 YAML 配置文件，解析 video_dit_config 和 action_dit_config
-        3. 加载 WanVideoDiT 预训练模型（通过 load_wan22_ti2v_5b_components）
+        3. 加载 WanVideoDiT 预训练模型（通过 load_wan_video_components）
         4. 创建空的 ActionDiT 模型
         5. 校验 ActionDiT 与 VideoDiT 的关键结构（num_heads, attn_head_dim, num_layers）一致
         6. 遍历 ActionDiT 骨干网络的所有权重键：
@@ -355,11 +356,15 @@ def main() -> None:
           f"Preprocessing ActionDiT backbone with dtype={torch_dtype} on device={args.device}, "
           f"apply_alpha_scaling={apply_alpha_scaling}.")
     load_text_encoder = _parse_bool(cfg.get("load_text_encoder", False))
-    # 加载 Wan2.2 视频 DiT 预训练组件
-    components = load_wan22_ti2v_5b_components(
+    video_backbone_type = cfg.get("video_backbone_type", "wan2_2_ti2v")
+    video_backbone_name = cfg.get("video_backbone_name", None)
+    # 加载视频 DiT 预训练组件
+    components = load_wan_video_components(
         device=args.device,
         torch_dtype=torch_dtype,
         model_id=cfg.get("model_id", "Wan-AI/Wan2.2-TI2V-5B"),
+        video_backbone_type=video_backbone_type,
+        video_backbone_name=video_backbone_name,
         tokenizer_model_id=cfg.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
         redirect_common_files=redirect_common_files,
         dit_config=video_cfg,

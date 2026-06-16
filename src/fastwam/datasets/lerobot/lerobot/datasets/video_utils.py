@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import gc
 import importlib
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +29,9 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+
+_TORCHVISION_DECODE_CALLS = 0
+_TORCHVISION_GC_EVERY = int(os.environ.get("FASTWAM_VIDEO_DECODE_GC_EVERY", "200"))
 
 
 def get_safe_default_codec():
@@ -109,36 +114,39 @@ def decode_video_frames_torchvision(
     if backend == "pyav":
         keyframes_only = True  # pyav doesn't support accurate seek
 
-    # set a video stream reader
-    # TODO(rcadene): also load audio stream at the same time
-    reader = torchvision.io.VideoReader(video_path, "video")
-
-    # set the first and last requested timestamps
-    # Note: previous timestamps are usually loaded, since we need to access the previous key frame
-    first_ts = min(timestamps)
-    last_ts = max(timestamps)
-
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
-
-    # load all frames until last requested frame
     loaded_frames = []
     loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
-
-    if backend == "pyav":
-        reader.container.close()
-
     reader = None
+    frame = None
+    try:
+        # set a video stream reader
+        # TODO(rcadene): also load audio stream at the same time
+        reader = torchvision.io.VideoReader(video_path, "video")
+
+        # set the first and last requested timestamps
+        # Note: previous timestamps are usually loaded, since we need to access the previous key frame
+        first_ts = min(timestamps)
+        last_ts = max(timestamps)
+
+        # access closest key frame of the first requested frame
+        # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
+        # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
+        reader.seek(first_ts, keyframes_only=keyframes_only)
+
+        # load all frames until last requested frame
+        for frame in reader:
+            current_ts = frame["pts"]
+            if log_loaded_timestamps:
+                logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+            loaded_frames.append(frame["data"])
+            loaded_ts.append(current_ts)
+            if current_ts >= last_ts:
+                break
+    finally:
+        _close_torchvision_video_reader(reader)
+        del frame
+        del reader
+        _maybe_collect_video_decode_garbage()
 
     # Use float32 for timestamp distance computation (torch.cdist doesn't support bfloat16).
     query_ts = torch.tensor(timestamps, dtype=torch.float32)
@@ -172,6 +180,33 @@ def decode_video_frames_torchvision(
 
     assert len(timestamps) == len(closest_frames)
     return closest_frames
+
+
+def _close_torchvision_video_reader(reader) -> None:
+    if reader is None:
+        return
+    close = getattr(reader, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as err:
+            logging.debug("Ignoring VideoReader.close() error: %r", err)
+    container = getattr(reader, "container", None)
+    close_container = getattr(container, "close", None)
+    if callable(close_container):
+        try:
+            close_container()
+        except Exception as err:
+            logging.debug("Ignoring VideoReader.container.close() error: %r", err)
+
+
+def _maybe_collect_video_decode_garbage() -> None:
+    global _TORCHVISION_DECODE_CALLS
+    if _TORCHVISION_GC_EVERY <= 0:
+        return
+    _TORCHVISION_DECODE_CALLS += 1
+    if _TORCHVISION_DECODE_CALLS % _TORCHVISION_GC_EVERY == 0:
+        gc.collect()
 
 
 def decode_video_frames_torchcodec(

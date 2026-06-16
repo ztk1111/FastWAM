@@ -8,7 +8,12 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
-from .helpers.loader import load_wan22_ti2v_5b_components
+from .helpers.loader import (
+    apply_video_backbone_preset,
+    load_wan_video_components,
+    resolve_video_backbone_type,
+    sync_action_dit_config_with_video_backbone,
+)
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
@@ -69,6 +74,8 @@ class FastWAM(torch.nn.Module):
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
+        video_latent_spatial_downsample_factor: int = 1,
+        apply_video_latent_downsample_to_action_branch: bool = False,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         goal_token_config: Optional[dict] = None,
@@ -142,6 +149,15 @@ class FastWAM(torch.nn.Module):
 
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
+        self.video_latent_spatial_downsample_factor = int(video_latent_spatial_downsample_factor)
+        if self.video_latent_spatial_downsample_factor < 1:
+            raise ValueError(
+                "`video_latent_spatial_downsample_factor` must be >= 1, "
+                f"got {self.video_latent_spatial_downsample_factor}."
+            )
+        self.apply_video_latent_downsample_to_action_branch = bool(
+            apply_video_latent_downsample_to_action_branch
+        )
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
         self.subgoal_latent_config = dict(subgoal_latent_config or {})
@@ -214,6 +230,8 @@ class FastWAM(torch.nn.Module):
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+        video_backbone_type: str = "wan2_2_ti2v",
+        video_backbone_name: str | None = None,
         tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
         tokenizer_max_len: int = 512,
         load_text_encoder: bool = True,
@@ -230,6 +248,8 @@ class FastWAM(torch.nn.Module):
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
+        video_latent_spatial_downsample_factor: int = 1,
+        apply_video_latent_downsample_to_action_branch: bool = False,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         goal_token_config: Optional[dict] = None,
@@ -271,11 +291,23 @@ class FastWAM(torch.nn.Module):
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
         if "text_dim" not in video_dit_config:
             raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
+        resolved_video_backbone_type = resolve_video_backbone_type(video_backbone_type)
+        video_dit_config = apply_video_backbone_preset(
+            dict(video_dit_config),
+            resolved_video_backbone_type,
+        )
+        action_dit_config = {} if action_dit_config is None else dict(action_dit_config)
+        action_dit_config = sync_action_dit_config_with_video_backbone(
+            action_dit_config=action_dit_config,
+            video_dit_config=video_dit_config,
+        )
 
-        components = load_wan22_ti2v_5b_components(
+        components = load_wan_video_components(
             device=device,
             torch_dtype=torch_dtype,
             model_id=model_id,
+            video_backbone_type=resolved_video_backbone_type,
+            video_backbone_name=video_backbone_name,
             tokenizer_model_id=tokenizer_model_id,
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
@@ -325,6 +357,8 @@ class FastWAM(torch.nn.Module):
             action_train_shift=action_train_shift,
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
+            video_latent_spatial_downsample_factor=video_latent_spatial_downsample_factor,
+            apply_video_latent_downsample_to_action_branch=apply_video_latent_downsample_to_action_branch,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
             goal_token_config=goal_token_config,
@@ -506,6 +540,163 @@ class FastWAM(torch.nn.Module):
             frame = video_tensor[:, t].permute(1, 2, 0).numpy()
             frames.append(Image.fromarray(frame))
         return frames
+
+    def _maybe_downsample_video_latents_for_backbone(
+        self,
+        latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[dict[str, Any]]]:
+        """Optionally compress full-video latent grids before the video backbone.
+
+        This is intended for Wan2.1-T2V style backbones where the latent grid is much
+        denser than Wan2.2-TI2V. Default factor=1 keeps the original FastWAM path
+        exactly unchanged.
+        """
+        factor = int(self.video_latent_spatial_downsample_factor)
+        if factor == 1:
+            return latents, None
+        if latents.ndim != 5:
+            raise ValueError(f"`latents` must be [B, C, T, H, W], got shape {tuple(latents.shape)}")
+        height = int(latents.shape[-2])
+        width = int(latents.shape[-1])
+        if height % factor != 0 or width % factor != 0:
+            raise ValueError(
+                "Latent spatial shape must be divisible by "
+                f"`video_latent_spatial_downsample_factor={factor}`, "
+                f"got HxW=({height}, {width})."
+            )
+        latents_down = F.avg_pool3d(
+            latents,
+            kernel_size=(1, factor, factor),
+            stride=(1, factor, factor),
+        )
+        return latents_down, {
+            "original_spatial_shape": (height, width),
+            "downsample_factor": factor,
+        }
+
+    def _restore_video_prediction_spatial_resolution(
+        self,
+        pred_video: torch.Tensor,
+        compression_meta: Optional[dict[str, Any]],
+    ) -> torch.Tensor:
+        if compression_meta is None:
+            return pred_video
+        if pred_video.ndim != 5:
+            raise ValueError(f"`pred_video` must be [B, C, T, H, W], got shape {tuple(pred_video.shape)}")
+        original_spatial_shape = compression_meta.get("original_spatial_shape")
+        if original_spatial_shape is None or len(original_spatial_shape) != 2:
+            raise ValueError("`compression_meta['original_spatial_shape']` must be a 2-tuple.")
+        original_height = int(original_spatial_shape[0])
+        original_width = int(original_spatial_shape[1])
+        if pred_video.shape[-2:] == (original_height, original_width):
+            return pred_video
+
+        batch_size, channels, num_frames, _, _ = pred_video.shape
+        pred_video_btc = pred_video.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames,
+            channels,
+            pred_video.shape[-2],
+            pred_video.shape[-1],
+        )
+        pred_video_btc = F.interpolate(
+            pred_video_btc,
+            size=(original_height, original_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return pred_video_btc.reshape(
+            batch_size,
+            num_frames,
+            channels,
+            original_height,
+            original_width,
+        ).permute(0, 2, 1, 3, 4).contiguous()
+
+    def _build_video_pre(
+        self,
+        latents_video: torch.Tensor,
+        timestep_video: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        action: Optional[torch.Tensor] = None,
+        apply_spatial_downsample: bool = True,
+        extra_context_emb: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        compression_meta = None
+        latents_for_backbone = latents_video
+        if apply_spatial_downsample:
+            latents_for_backbone, compression_meta = self._maybe_downsample_video_latents_for_backbone(latents_video)
+        video_pre = self.video_expert.pre_dit(
+            x=latents_for_backbone,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            extra_context_emb=extra_context_emb,
+        )
+        return video_pre, compression_meta
+
+    def _use_lowres_video_training_objective(self) -> bool:
+        return int(self.video_latent_spatial_downsample_factor) > 1
+
+    def _prepare_video_training_targets(
+        self,
+        video_supervision_latents: torch.Tensor,
+        timestep_video: torch.Tensor,
+        first_frame_latents: Optional[torch.Tensor],
+    ) -> dict[str, Any]:
+        video_supervision_latents_model = video_supervision_latents
+        first_frame_latents_model = first_frame_latents
+        apply_spatial_downsample = True
+        restore_spatial_resolution = True
+
+        if self._use_lowres_video_training_objective():
+            video_supervision_latents_model, _ = self._maybe_downsample_video_latents_for_backbone(
+                video_supervision_latents
+            )
+            if first_frame_latents is not None:
+                first_frame_latents_model, _ = self._maybe_downsample_video_latents_for_backbone(
+                    first_frame_latents
+                )
+            apply_spatial_downsample = False
+            restore_spatial_resolution = False
+
+        noise_video = torch.randn_like(video_supervision_latents_model)
+        latents_video = self.train_video_scheduler.add_noise(
+            video_supervision_latents_model,
+            noise_video,
+            timestep_video,
+        )
+        target_video = self.train_video_scheduler.training_target(
+            video_supervision_latents_model,
+            noise_video,
+            timestep_video,
+        )
+        if first_frame_latents_model is not None:
+            latents_video[:, :, 0:1] = first_frame_latents_model
+
+        return {
+            "video_supervision_latents_model": video_supervision_latents_model,
+            "first_frame_latents_model": first_frame_latents_model,
+            "latents_video": latents_video,
+            "target_video": target_video,
+            "apply_spatial_downsample": apply_spatial_downsample,
+            "restore_spatial_resolution": restore_spatial_resolution,
+        }
+
+    def _decode_video_tokens(
+        self,
+        video_tokens: torch.Tensor,
+        video_pre: dict[str, Any],
+        compression_meta: Optional[dict[str, Any]],
+        restore_spatial_resolution: bool = True,
+    ) -> torch.Tensor:
+        pred_video = self.video_expert.post_dit(video_tokens, video_pre)
+        if not restore_spatial_resolution:
+            return pred_video
+        return self._restore_video_prediction_spatial_resolution(pred_video, compression_meta)
 
     def build_inputs(self, sample, tiled: bool = False):
         """从数据样本构建模型训练/推理所需的所有输入张量。
@@ -775,19 +966,18 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
-        # --- 视频分支加噪 ---
-        noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
         )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-
-        # 如果配置了 fuse 首帧，对首帧隐变量保持不变（不加噪）
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        video_train_targets = self._prepare_video_training_targets(
+            video_supervision_latents=input_latents,
+            timestep_video=timestep_video,
+            first_frame_latents=inputs["first_frame_latents"],
+        )
+        latents = video_train_targets["latents_video"]
+        target_video = video_train_targets["target_video"]
 
         # --- 动作分支加噪 ---
         noise_action = torch.randn_like(action)
@@ -800,13 +990,14 @@ class FastWAM(torch.nn.Module):
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
         # --- 视频和动作分别经过 pre_dit ---
-        video_pre = self.video_expert.pre_dit(
-            x=latents,
+        video_pre, compression_meta = self._build_video_pre(
+            latents_video=latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
             action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            apply_spatial_downsample=video_train_targets["apply_spatial_downsample"],
         )
 
         action_pre = self.action_expert.pre_dit(
@@ -853,7 +1044,12 @@ class FastWAM(torch.nn.Module):
         )
 
         # --- post_dit 重建 ---
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_video = self._decode_video_tokens(
+            tokens_out["video"],
+            video_pre,
+            compression_meta,
+            restore_spatial_resolution=video_train_targets["restore_spatial_resolution"],
+        )
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
         # --- 视频损失计算 ---
@@ -925,8 +1121,8 @@ class FastWAM(torch.nn.Module):
             pred_video [1, C, T_lat, H_lat, W_lat]: 视频专家预测的噪声
             pred_action [1, T, a_dim]: 动作专家预测的噪声
         """
-        video_pre = self.video_expert.pre_dit(
-            x=latents_video,
+        video_pre, compression_meta = self._build_video_pre(
+            latents_video=latents_video,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
@@ -973,7 +1169,7 @@ class FastWAM(torch.nn.Module):
             },
         )
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_video = self._decode_video_tokens(tokens_out["video"], video_pre, compression_meta)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
         return pred_video, pred_action
 
@@ -1006,13 +1202,14 @@ class FastWAM(torch.nn.Module):
         """
         # 视频侧时间步设为 0（无噪声），仅提供视觉条件
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
-        video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+        video_pre, _ = self._build_video_pre(
+            latents_video=first_frame_latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            apply_spatial_downsample=self.apply_video_latent_downsample_to_action_branch,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -1453,13 +1650,14 @@ class FastWAM(torch.nn.Module):
             dtype=first_frame_latents.dtype,
             device=self.device,
         )
-        video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+        video_pre, _ = self._build_video_pre(
+            latents_video=first_frame_latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            apply_spatial_downsample=self.apply_video_latent_downsample_to_action_branch,
         )
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(

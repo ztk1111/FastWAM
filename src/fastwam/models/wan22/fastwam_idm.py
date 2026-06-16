@@ -223,17 +223,20 @@ class FastWAMIDM(FastWAMJoint):
 
         first_frame_latents = inputs["first_frame_latents"]
 
-        # Branch A: noisy video latents.
-        noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
         )
-        latents_noisy = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-        if first_frame_latents is not None:
-            latents_noisy[:, :, 0:1] = first_frame_latents
+        video_train_targets = self._prepare_video_training_targets(
+            video_supervision_latents=input_latents,
+            timestep_video=timestep_video,
+            first_frame_latents=first_frame_latents,
+        )
+        video_supervision_latents_model = video_train_targets["video_supervision_latents_model"]
+        first_frame_latents_model = video_train_targets["first_frame_latents_model"]
+        latents_noisy = video_train_targets["latents_video"]
+        target_video = video_train_targets["target_video"]
 
         # Branch B: noisy action.
         noise_action = torch.randn_like(action)
@@ -248,40 +251,42 @@ class FastWAMIDM(FastWAMJoint):
         # Branch C: teacher-forcing condition uses GT video latents.
         cond_noise_mask = torch.rand((batch_size,), device=self.device) < float(self.video_cond_noise_prob)
         timestep_video_cond = torch.zeros_like(timestep_video, dtype=input_latents.dtype, device=self.device)
-        latents_cond = input_latents
+        latents_cond = video_supervision_latents_model
         if bool(cond_noise_mask.any()):
             timestep_video_cond_sampled = self.train_video_scheduler.sample_training_t(
                 batch_size=batch_size,
                 device=self.device,
-                dtype=input_latents.dtype,
+                dtype=video_supervision_latents_model.dtype,
             )
             timestep_video_cond = torch.where(cond_noise_mask, timestep_video_cond_sampled, timestep_video_cond)
-            noise_video_cond = torch.randn_like(input_latents)
+            noise_video_cond = torch.randn_like(video_supervision_latents_model)
             latents_cond_noisy = self.train_video_scheduler.add_noise(
-                input_latents, noise_video_cond, timestep_video_cond_sampled
+                video_supervision_latents_model, noise_video_cond, timestep_video_cond_sampled
             )
             cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
-            latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
-        if first_frame_latents is not None:
+            latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, video_supervision_latents_model)
+        if first_frame_latents_model is not None:
             latents_cond = latents_cond.clone()
-            latents_cond[:, :, 0:1] = first_frame_latents
+            latents_cond[:, :, 0:1] = first_frame_latents_model
 
-        video_pre_noisy = self.video_expert.pre_dit(
-            x=latents_noisy,
-            timestep=timestep_video,
+        video_pre_noisy, compression_meta_noisy = self._build_video_pre(
+            latents_video=latents_noisy,
+            timestep_video=timestep_video,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            apply_spatial_downsample=video_train_targets["apply_spatial_downsample"],
             extra_context_emb=None,
         )
-        video_pre_cond = self.video_expert.pre_dit(
-            x=latents_cond,
-            timestep=timestep_video_cond,
+        video_pre_cond, _ = self._build_video_pre(
+            latents_video=latents_cond,
+            timestep_video=timestep_video_cond,
             context=context,
             context_mask=context_mask,
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
+            apply_spatial_downsample=video_train_targets["apply_spatial_downsample"],
             extra_context_emb=None,
         )
         if video_pre_noisy["t_mod"].ndim != 4 or video_pre_cond["t_mod"].ndim != 4:
@@ -345,11 +350,16 @@ class FastWAMIDM(FastWAMJoint):
         )
 
         pred_video_tokens = tokens_out["video"][:, :noisy_video_seq_len]
-        pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
+        pred_video = self._decode_video_tokens(
+            pred_video_tokens,
+            video_pre_noisy,
+            compression_meta_noisy,
+            restore_spatial_resolution=video_train_targets["restore_spatial_resolution"],
+        )
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = first_frame_latents is None
-        if first_frame_latents is not None:
+        include_initial_video_step = first_frame_latents_model is None
+        if first_frame_latents_model is not None:
             pred_video = pred_video[:, :, 1:]
             target_video = target_video[:, :, 1:]
 
@@ -581,15 +591,17 @@ class FastWAMIDM(FastWAMJoint):
         )
         for step_t_video, step_delta_video in zip(infer_timesteps_video, infer_deltas_video):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
-            pred_video = self.video_expert(
-                x=latents_video,
-                timestep=timestep_video,
+            video_pre, compression_meta = self._build_video_pre(
+                latents_video=latents_video,
+                timestep_video=timestep_video,
                 context=context,
                 context_mask=context_mask,
                 action=None,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 extra_context_emb=None,
             )
+            video_tokens = self.video_expert.forward_backbone(video_pre)
+            pred_video = self._decode_video_tokens(video_tokens, video_pre, compression_meta)
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
@@ -598,9 +610,9 @@ class FastWAMIDM(FastWAMJoint):
         timestep_video_cond = torch.zeros(
             (latents_video.shape[0],), dtype=latents_video.dtype, device=self.device
         )
-        video_pre_cond = self.video_expert.pre_dit(
-            x=latents_video,
-            timestep=timestep_video_cond,
+        video_pre_cond, _ = self._build_video_pre(
+            latents_video=latents_video,
+            timestep_video=timestep_video_cond,
             context=context,
             context_mask=context_mask,
             action=None,

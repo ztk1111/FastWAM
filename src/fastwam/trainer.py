@@ -92,6 +92,9 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        self.persistent_workers = bool(cfg.get("persistent_workers", False)) and self.num_workers > 0
+        prefetch_factor = cfg.get("prefetch_factor", None)
+        self.prefetch_factor = None if prefetch_factor is None else int(prefetch_factor)
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -263,15 +266,18 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            sampler=self.train_sampler,
-            num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            worker_init_fn=worker_init_fn,
-        )
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "sampler": self.train_sampler,
+            "num_workers": self.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "worker_init_fn": worker_init_fn,
+            "persistent_workers": self.persistent_workers,
+        }
+        if self.num_workers > 0 and self.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(dataset, **loader_kwargs)
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         """
