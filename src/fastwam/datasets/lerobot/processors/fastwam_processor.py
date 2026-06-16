@@ -117,6 +117,11 @@ class FastWAMProcessor(BaseProcessor):
             stats=dataset_stats,
         )
 
+    def build_reverse_action_from_normalized(self, action: torch.Tensor) -> torch.Tensor:
+        if action.ndim != 2:
+            raise ValueError(f"`action` must be [T, D], got shape {tuple(action.shape)}.")
+        return action.flip(dims=(0,)).clone()
+
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:
         """
         Args:
@@ -263,9 +268,11 @@ class FastWAMProcessor(BaseProcessor):
 
         if "action" in data:
             sample["action"] = data["action"] # [action_horizon, action_dim]
+            sample["reverse_action"] = self.build_reverse_action_from_normalized(data["action"])
             sample["action_is_pad"] = data["action_is_pad"] # [action_horizon,]
             sample["action_dim_is_pad"] = data["action_dim_is_pad"] # [action_dim,]
             assert sample["action"].shape[-1] == self.action_output_dim
+            assert sample["reverse_action"].shape == sample["action"].shape
             # sample["action"][sample["action_is_pad"], :-1] = 0.0 # NOTE: we assume use delta_eef_pose + gripper， so pad action is 0
 
         

@@ -105,23 +105,84 @@ class FastWAMIDM(FastWAMJoint):
         mask[cond_end:, noisy_end:cond_end] = True
         return mask
 
-    def training_loss(self, sample, tiled: bool = False):
-        """FastWAMIDM 的训练损失计算。
 
-        与父类的关键区别：
-          1. 三个分支并行处理：
-             - 分支 A（噪声视频）：视频扩散目标的标准加噪视频
-             - 分支 B（加噪动作）：动作扩散目标的标准加噪动作
-             - 分支 C（条件视频）：teacher-forcing 条件视频（每样本独立概率加噪）
-          2. 视频专家输入 = [分支A tokens | 分支C tokens] 拼接
-          3. 使用 _build_teacher_forcing_attention_mask 代替标准掩码
-          4. 联合损失 = 视频损失（仅分支A）+ 动作损失（分支B）
+    @torch.no_grad()
+    def _build_bidirectional_teacher_forcing_attention_mask(
+        self,
+        noisy_video_seq_len: int,
+        cond_video_seq_len: int,
+        reverse_cond_video_seq_len: int,
+        action_seq_len: int,
+        reverse_action_seq_len: int,
+        noisy_video_tokens_per_frame: int,
+        cond_video_tokens_per_frame: int,
+        reverse_cond_video_tokens_per_frame: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build IDM teacher-forcing mask for forward and backward action branches.
 
-        输入: sample (dict) — 包含 video, context, context_mask, action 等
-              tiled (bool): VAE 分块处理
-
-        输出: (loss_total, loss_dict)
+        Sequence layout: [noisy_video | forward_cond_video | reverse_cond_video | forward_action | reverse_action].
+        Forward and reverse action chunks are isolated from each other and attend only to their matching video direction.
         """
+        if noisy_video_tokens_per_frame != cond_video_tokens_per_frame:
+            raise ValueError(
+                "Teacher-forcing requires identical `tokens_per_frame` for noisy and forward cond video branches, "
+                f"got {noisy_video_tokens_per_frame} and {cond_video_tokens_per_frame}."
+            )
+        if noisy_video_tokens_per_frame != reverse_cond_video_tokens_per_frame:
+            raise ValueError(
+                "Teacher-forcing requires identical `tokens_per_frame` for noisy and reverse cond video branches, "
+                f"got {noisy_video_tokens_per_frame} and {reverse_cond_video_tokens_per_frame}."
+            )
+
+        noisy_end = noisy_video_seq_len
+        cond_end = noisy_end + cond_video_seq_len
+        reverse_cond_end = cond_end + reverse_cond_video_seq_len
+        action_end = reverse_cond_end + action_seq_len
+        total_seq_len = action_end + reverse_action_seq_len
+        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+
+        mask[:noisy_end, :noisy_end] = self.video_expert.build_video_to_video_mask(
+            video_seq_len=noisy_video_seq_len,
+            video_tokens_per_frame=noisy_video_tokens_per_frame,
+            device=device,
+        )
+        mask[noisy_end:cond_end, noisy_end:cond_end] = self.video_expert.build_video_to_video_mask(
+            video_seq_len=cond_video_seq_len,
+            video_tokens_per_frame=cond_video_tokens_per_frame,
+            device=device,
+        )
+        mask[cond_end:reverse_cond_end, cond_end:reverse_cond_end] = self.video_expert.build_video_to_video_mask(
+            video_seq_len=reverse_cond_video_seq_len,
+            video_tokens_per_frame=reverse_cond_video_tokens_per_frame,
+            device=device,
+        )
+
+        mask[reverse_cond_end:action_end, reverse_cond_end:action_end] = True
+        mask[action_end:, action_end:] = True
+        mask[reverse_cond_end:action_end, noisy_end:cond_end] = True
+        mask[action_end:, cond_end:reverse_cond_end] = True
+        return mask
+
+    @staticmethod
+    def _reverse_action_for_backward_generation(action: torch.Tensor) -> torch.Tensor:
+        return action.flip(dims=(1,)).clone()
+
+    @staticmethod
+    def _masked_action_loss_per_sample(
+        pred_action: torch.Tensor,
+        target_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            return (action_loss_token * valid).sum(dim=1) / valid_sum
+        return action_loss_token.mean(dim=1)
+
+    def training_loss(self, sample, tiled: bool = False):
+        """FastWAMIDM 的训练损失计算。"""
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -131,6 +192,26 @@ class FastWAMIDM(FastWAMJoint):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
         fuse_flag = inputs["fuse_vae_embedding_in_latents"]
+        enable_reverse_action_loss = bool(getattr(self, "enable_reverse_action_loss", False))
+
+        reverse_action = None
+        reverse_action_is_pad = None
+        if enable_reverse_action_loss:
+            reverse_action = sample.get("reverse_action")
+            if reverse_action is None:
+                reverse_action = self._reverse_action_for_backward_generation(action)
+            else:
+                if reverse_action.ndim != 3:
+                    raise ValueError(
+                        f"`sample['reverse_action']` must be 3D [B, T, a_dim], got shape {tuple(reverse_action.shape)}"
+                    )
+                if reverse_action.shape != action.shape:
+                    raise ValueError(
+                        "`sample['reverse_action']` shape mismatch: "
+                        f"got {tuple(reverse_action.shape)} vs action {tuple(action.shape)}"
+                    )
+                reverse_action = reverse_action.to(device=self.device, dtype=action.dtype, non_blocking=True)
+            reverse_action_is_pad = action_is_pad.flip(dims=(1,)) if action_is_pad is not None else None
 
         # Branch A: noisy video (for video denoising target).
         # 分支 A：噪声视频（用于视频去噪目标）
@@ -145,8 +226,8 @@ class FastWAMIDM(FastWAMJoint):
         if inputs["first_frame_latents"] is not None:
             latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
 
-        # Branch B: noisy action.
-        # 分支 B：加噪动作
+        # Branch B: noisy forward action.
+        # 分支 B：加噪正向动作
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
@@ -156,10 +237,20 @@ class FastWAMIDM(FastWAMJoint):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
+        if enable_reverse_action_loss:
+            # Branch B2: noisy backward action. It shares the forward timestep so both
+            # action chunks can share ActionDiT timestep modulation in one MoT pass.
+            # 分支 B2：加噪反向动作。与正向动作共享 timestep，便于一次 MoT 前向完成。
+            noise_action_reverse = torch.randn_like(reverse_action)
+            noisy_action_reverse = self.train_action_scheduler.add_noise(
+                reverse_action, noise_action_reverse, timestep_action
+            )
+            target_action_reverse = self.train_action_scheduler.training_target(
+                reverse_action, noise_action_reverse, timestep_action
+            )
+
         # Branch C: teacher-forcing cond-video.
-        # 分支 C：Teacher-Forcing 条件视频
-        # Each sample is independently noised with probability `video_cond_noise_prob`.
-        # 每个样本独立地以 probability=video_cond_noise_prob 的概率被加噪
+        # 分支 C：Teacher-Forcing 正向条件视频
         cond_noise_mask = torch.rand((batch_size,), device=self.device) < float(self.video_cond_noise_prob)
         timestep_video_cond = torch.zeros_like(timestep_video, dtype=input_latents.dtype, device=self.device)
         latents_cond = input_latents
@@ -176,10 +267,17 @@ class FastWAMIDM(FastWAMJoint):
             )
             cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
             latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
-        # 首帧始终保持一致（无论是否加噪）
         if inputs["first_frame_latents"] is not None:
             latents_cond = latents_cond.clone()
             latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
+
+        if enable_reverse_action_loss:
+            # Branch C2: reverse teacher-forcing cond-video.
+            # 分支 C2：反向条件视频，时间维从后往前。
+            latents_cond_reverse = latents_cond.flip(dims=(2,))
+            if inputs["first_frame_latents"] is not None:
+                latents_cond_reverse = latents_cond_reverse.clone()
+                latents_cond_reverse[:, :, 0:1] = input_latents[:, :, -1:]
 
         # ---- pre_dit 编码 ----
         video_pre_noisy = self.video_expert.pre_dit(
@@ -198,7 +296,21 @@ class FastWAMIDM(FastWAMJoint):
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
         )
+        if enable_reverse_action_loss:
+            video_pre_cond_reverse = self.video_expert.pre_dit(
+                x=latents_cond_reverse,
+                timestep=timestep_video_cond,
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
         if video_pre_noisy["t_mod"].ndim != 4 or video_pre_cond["t_mod"].ndim != 4:
+            raise ValueError(
+                "Teacher-forcing requires token-wise `t_mod`; "
+                "ensure `seperated_timestep=true` and `fuse_vae_embedding_in_latents=true`."
+            )
+        if enable_reverse_action_loss and video_pre_cond_reverse["t_mod"].ndim != 4:
             raise ValueError(
                 "Teacher-forcing requires token-wise `t_mod`; "
                 "ensure `seperated_timestep=true` and `fuse_vae_embedding_in_latents=true`."
@@ -210,39 +322,93 @@ class FastWAMIDM(FastWAMJoint):
             context=context,
             context_mask=context_mask,
         )
+        if enable_reverse_action_loss:
+            action_reverse_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action_reverse,
+                timestep=timestep_action,
+                context=context,
+                context_mask=context_mask,
+            )
 
         noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])
         cond_video_seq_len = int(video_pre_cond["tokens"].shape[1])
         noisy_video_tokens_per_frame = int(video_pre_noisy["meta"]["tokens_per_frame"])
         cond_video_tokens_per_frame = int(video_pre_cond["meta"]["tokens_per_frame"])
 
-        # Concatenate [noisy_video, cond_video] as the video expert sequence.
-        # 将 [噪声视频 | 条件视频] 拼接作为视频专家的完整 token 序列
-        merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
-        merged_video_freqs = torch.cat([video_pre_noisy["freqs"], video_pre_cond["freqs"]], dim=0)
-        merged_video_t_mod = torch.cat([video_pre_noisy["t_mod"], video_pre_cond["t_mod"]], dim=1)
-        merged_video_context_mask = torch.cat([video_pre_noisy["context_mask"], video_pre_cond["context_mask"]], dim=1)
-
-        # 使用 Teacher-Forcing 注意力掩码：动作仅关注条件视频
-        attention_mask = self._build_teacher_forcing_attention_mask(
-            noisy_video_seq_len=noisy_video_seq_len,
-            cond_video_seq_len=cond_video_seq_len,
-            action_seq_len=action_pre["tokens"].shape[1],
-            noisy_video_tokens_per_frame=noisy_video_tokens_per_frame,
-            cond_video_tokens_per_frame=cond_video_tokens_per_frame,
-            device=merged_video_tokens.device,
-        )
+        if enable_reverse_action_loss:
+            reverse_cond_video_seq_len = int(video_pre_cond_reverse["tokens"].shape[1])
+            reverse_cond_video_tokens_per_frame = int(video_pre_cond_reverse["meta"]["tokens_per_frame"])
+            # Concatenate [noisy_video, forward_cond_video, reverse_cond_video].
+            # 将 [噪声视频 | 正向条件视频 | 反向条件视频] 拼接作为视频专家的完整 token 序列
+            merged_video_tokens = torch.cat(
+                [video_pre_noisy["tokens"], video_pre_cond["tokens"], video_pre_cond_reverse["tokens"]],
+                dim=1,
+            )
+            merged_video_freqs = torch.cat(
+                [video_pre_noisy["freqs"], video_pre_cond["freqs"], video_pre_cond_reverse["freqs"]],
+                dim=0,
+            )
+            merged_video_t_mod = torch.cat(
+                [video_pre_noisy["t_mod"], video_pre_cond["t_mod"], video_pre_cond_reverse["t_mod"]],
+                dim=1,
+            )
+            merged_video_context_mask = torch.cat(
+                [
+                    video_pre_noisy["context_mask"],
+                    video_pre_cond["context_mask"],
+                    video_pre_cond_reverse["context_mask"],
+                ],
+                dim=1,
+            )
+            merged_action_tokens = torch.cat([action_pre["tokens"], action_reverse_pre["tokens"]], dim=1)
+            merged_action_freqs = torch.cat([action_pre["freqs"], action_reverse_pre["freqs"]], dim=0)
+            merged_action_context_mask = torch.cat(
+                [action_pre["context_mask"], action_reverse_pre["context_mask"]],
+                dim=1,
+            )
+            attention_mask = self._build_bidirectional_teacher_forcing_attention_mask(
+                noisy_video_seq_len=noisy_video_seq_len,
+                cond_video_seq_len=cond_video_seq_len,
+                reverse_cond_video_seq_len=reverse_cond_video_seq_len,
+                action_seq_len=action_pre["tokens"].shape[1],
+                reverse_action_seq_len=action_reverse_pre["tokens"].shape[1],
+                noisy_video_tokens_per_frame=noisy_video_tokens_per_frame,
+                cond_video_tokens_per_frame=cond_video_tokens_per_frame,
+                reverse_cond_video_tokens_per_frame=reverse_cond_video_tokens_per_frame,
+                device=merged_video_tokens.device,
+            )
+            action_tokens_in = merged_action_tokens
+            action_freqs_in = merged_action_freqs
+            action_context_mask_in = merged_action_context_mask
+        else:
+            # Concatenate [noisy_video, cond_video] as the video expert sequence.
+            # 将 [噪声视频 | 条件视频] 拼接作为视频专家的完整 token 序列
+            merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
+            merged_video_freqs = torch.cat([video_pre_noisy["freqs"], video_pre_cond["freqs"]], dim=0)
+            merged_video_t_mod = torch.cat([video_pre_noisy["t_mod"], video_pre_cond["t_mod"]], dim=1)
+            merged_video_context_mask = torch.cat([video_pre_noisy["context_mask"], video_pre_cond["context_mask"]], dim=1)
+            attention_mask = self._build_teacher_forcing_attention_mask(
+                noisy_video_seq_len=noisy_video_seq_len,
+                cond_video_seq_len=cond_video_seq_len,
+                action_seq_len=action_pre["tokens"].shape[1],
+                noisy_video_tokens_per_frame=noisy_video_tokens_per_frame,
+                cond_video_tokens_per_frame=cond_video_tokens_per_frame,
+                device=merged_video_tokens.device,
+            )
+            action_tokens_in = action_pre["tokens"]
+            action_freqs_in = action_pre["freqs"]
+            action_context_mask_in = action_pre["context_mask"]
 
         # ---- MoT 混合注意力 ----
         tokens_out = self.mot(
             embeds_all={
                 "video": merged_video_tokens,
-                "action": action_pre["tokens"],
+                "action": action_tokens_in,
             },
             attention_mask=attention_mask,
             freqs_all={
                 "video": merged_video_freqs,
-                "action": action_pre["freqs"],
+                "action": action_freqs_in,
             },
             context_all={
                 "video": {
@@ -251,7 +417,7 @@ class FastWAMIDM(FastWAMJoint):
                 },
                 "action": {
                     "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                    "mask": action_context_mask_in,
                 },
             },
             t_mod_all={
@@ -260,11 +426,16 @@ class FastWAMIDM(FastWAMJoint):
             },
         )
 
-        # Only the noisy-video half contributes to video denoising loss.
+        # Only the noisy-video part contributes to video denoising loss.
         # 仅噪声视频部分参与视频去噪损失（条件视频不产生视频损失）
         pred_video_tokens = tokens_out["video"][:, :noisy_video_seq_len]
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        if enable_reverse_action_loss:
+            action_seq_len = action_pre["tokens"].shape[1]
+            pred_action = self.action_expert.post_dit(tokens_out["action"][:, :action_seq_len], action_pre)
+            pred_action_reverse = self.action_expert.post_dit(tokens_out["action"][:, action_seq_len:], action_reverse_pre)
+        else:
+            pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
         # ---- 损失计算 ----
         include_initial_video_step = inputs["first_frame_latents"] is None
@@ -283,24 +454,34 @@ class FastWAMIDM(FastWAMJoint):
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
+        action_loss_per_sample = self._masked_action_loss_per_sample(
+            pred_action=pred_action,
+            target_action=target_action,
+            action_is_pad=action_is_pad,
+        )
 
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
-
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_action_for_total = loss_action
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
-            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_action_forward": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+
+        if enable_reverse_action_loss:
+            action_reverse_loss_per_sample = self._masked_action_loss_per_sample(
+                pred_action=pred_action_reverse,
+                target_action=target_action_reverse,
+                action_is_pad=reverse_action_is_pad,
+            )
+            loss_action_reverse = (action_reverse_loss_per_sample * action_weight).mean()
+            loss_action_for_total = 0.5 * (loss_action + loss_action_reverse)
+            loss_dict["loss_action_reverse"] = self.loss_lambda_action * float(loss_action_reverse.detach().item())
+
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action_for_total
+        loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action_for_total.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()

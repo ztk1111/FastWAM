@@ -446,6 +446,7 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        enable_reverse_action_loss=bool(loss.get("enable_reverse_action_loss", False)),
     )
 
 

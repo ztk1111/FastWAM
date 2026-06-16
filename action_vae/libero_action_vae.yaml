@@ -1,0 +1,42 @@
+output_dir: runs/action_vae/libero
+seed: 42
+
+data:
+  dataset_dirs:
+    - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+  action_meta:
+    - key: default
+      raw_shape: 7
+      shape: 7
+  chunk_len: 32
+  global_sample_stride: 1
+  val_set_proportion: 0.01
+  normalize: true
+
+model:
+  latent_tokens: 3
+  latent_dim: 24
+  hidden_dim: 384
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+
+train:
+  batch_size: 512
+  stats_batch_size: 1024
+  num_workers: 4
+  max_steps: 20000
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  beta: 1.0e-4
+  jerk_weight: 1.0e-3
+  jerk_dims: 6
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 1000
+  eval_batches: 50
+  save_every: 2000
+

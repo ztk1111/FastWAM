@@ -56,3 +56,4 @@ action_scheduler:
 
 loss:
   lambda_action: 1.0
+  enable_reverse_action_loss: false

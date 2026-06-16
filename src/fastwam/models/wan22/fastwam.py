@@ -71,6 +71,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        enable_reverse_action_loss: bool = False,
     ):
         """初始化 FastWAM 模型。
 
@@ -141,6 +142,7 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.enable_reverse_action_loss = bool(enable_reverse_action_loss)
 
         self.to(self.device)
 
@@ -168,6 +170,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        enable_reverse_action_loss: bool = False,
     ):
         """从预训练的 Wan2.2-TI2V-5B 检查点加载并构建 FastWAM 模型。
 
@@ -256,6 +259,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            enable_reverse_action_loss=enable_reverse_action_loss,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -1527,7 +1531,7 @@ class FastWAM(torch.nn.Module):
         返回:
             payload (dict): 从检查点加载的原始字典
         """
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu",weights_only=False)
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:
